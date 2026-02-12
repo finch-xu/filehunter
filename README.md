@@ -116,6 +116,20 @@ mode = "latest_modified"  # or "sequential" (default) / "concurrent"
 | **Result determinism** | Config order | Non-deterministic | Deterministic (by mtime) |
 | **Best for** | General use, priority control | High-latency network mounts | Mirrored / staged storage |
 
+**Benchmark** (3 search paths, local SSD, release build):
+
+| Metric | `sequential` | `concurrent` | `latest_modified` |
+|---|---|---|---|
+| Single-request latency (1 KB) | 0.54 ms | 0.62 ms | 0.83 ms |
+| Single-request latency (1 MB) | 1.18 ms | 1.29 ms | 1.65 ms |
+| 50 concurrent total time (1 KB) | 164.16 ms | 164.68 ms | 232.44 ms |
+| 50 concurrent total time (1 MB) | 201.39 ms | 217.09 ms | 189.22 ms |
+| Idle memory (RSS) | 3.36 MB | 3.50 MB | 3.36 MB |
+| Peak memory (RSS) | 11.06 MB | 12.33 MB | 10.53 MB |
+| Peak CPU usage | 12.0% | 8.4% | 9.1% |
+
+> Run `bash bench/bench_modes.sh` to reproduce.
+
 ### Subdirectory Support
 
 Request paths can contain subdirectories of any depth. The full relative path is joined directly to each search root — there is no recursive filename search.
