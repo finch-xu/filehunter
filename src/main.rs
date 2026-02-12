@@ -62,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     info!(
         %addr,
+        locations = config.locations.len(),
         keepalive = config.server.keepalive,
         connection_timeout = config.server.connection_timeout,
         max_header_size = %config.server.max_header_size,

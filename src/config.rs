@@ -119,7 +119,7 @@ fn parse_byte_size(s: &str) -> Result<ByteSize, String> {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
-    pub search: SearchConfig,
+    pub locations: Vec<LocationConfig>,
 }
 
 /// All fields except `bind` have sensible defaults — existing configs keep working.
@@ -189,12 +189,15 @@ pub enum SearchMode {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SearchConfig {
+pub struct LocationConfig {
+    /// URL prefix for this location, e.g. "/imgs1".
+    pub prefix: String,
+
     /// Search strategy. Default: `"sequential"`.
     #[serde(default)]
     pub mode: SearchMode,
 
-    /// Search paths in priority order (first match wins in sequential mode).
+    /// Search paths for this location.
     pub paths: Vec<SearchPath>,
 }
 
@@ -224,6 +227,18 @@ impl SearchPath {
     }
 }
 
+/// Normalize a location prefix: ensure it starts with `/` and has no trailing `/`.
+pub fn normalize_prefix(raw: &str) -> String {
+    let mut p = raw.to_string();
+    if !p.starts_with('/') {
+        p.insert(0, '/');
+    }
+    while p.len() > 1 && p.ends_with('/') {
+        p.pop();
+    }
+    p
+}
+
 /// Minimum value hyper accepts for HTTP/1.1 read buffer size.
 const MIN_HEADER_SIZE: u64 = 8192;
 
@@ -246,8 +261,31 @@ impl Config {
         if self.server.stream_buffer_size.0 == 0 {
             return Err("stream_buffer_size must be > 0".into());
         }
-        if self.search.paths.is_empty() {
-            return Err("at least one search path must be configured".into());
+        if self.locations.is_empty() {
+            return Err("at least one [[locations]] must be configured".into());
+        }
+
+        let mut seen_prefixes = HashSet::new();
+        for loc in &self.locations {
+            if loc.paths.is_empty() {
+                return Err(format!(
+                    "location prefix={:?} must have at least one path",
+                    loc.prefix,
+                ));
+            }
+            if loc.prefix.contains('\0') || loc.prefix.contains("..") {
+                return Err(format!(
+                    "location prefix={:?} contains forbidden characters",
+                    loc.prefix,
+                ));
+            }
+            let normalized = normalize_prefix(&loc.prefix);
+            if !seen_prefixes.insert(normalized) {
+                return Err(format!(
+                    "duplicate location prefix={:?}",
+                    loc.prefix,
+                ));
+            }
         }
         Ok(())
     }

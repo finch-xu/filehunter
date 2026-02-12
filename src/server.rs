@@ -15,7 +15,7 @@ use tokio::fs::File;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, info, warn};
 
-use crate::config::{Config, SearchMode};
+use crate::config::{normalize_prefix, Config, LocationConfig, SearchMode};
 
 type ResponseBody = BoxBody<Bytes, std::io::Error>;
 
@@ -34,24 +34,24 @@ impl SearchRoot {
     }
 }
 
-pub struct FileSearcher {
+struct Location {
+    prefix: String,
     roots: Vec<SearchRoot>,
     search_mode: SearchMode,
-    max_body_size: u64,
-    max_file_size: u64,
-    stream_buffer_size: usize,
 }
 
-impl FileSearcher {
-    pub fn new(config: &Config) -> Self {
-        let roots: Vec<SearchRoot> = config
-            .search
+impl Location {
+    fn from_config(loc: &LocationConfig) -> Self {
+        let prefix = normalize_prefix(&loc.prefix);
+
+        let roots: Vec<SearchRoot> = loc
             .paths
             .iter()
             .filter_map(|entry| match entry.root.canonicalize() {
                 Ok(canonical) if canonical.is_dir() => {
                     let ext_set = entry.extension_set();
                     info!(
+                        prefix = %prefix,
                         path = %canonical.display(),
                         extensions = %ext_set.as_ref().map_or("*".into(), |s| {
                             let mut v: Vec<_> = s.iter().map(String::as_str).collect();
@@ -74,33 +74,28 @@ impl FileSearcher {
             .collect();
 
         if roots.is_empty() {
-            warn!("no valid search paths configured");
+            warn!(prefix = %prefix, "no valid search paths for location");
         }
 
-        info!(search_mode = ?config.search.mode, "search mode configured");
+        info!(prefix = %prefix, mode = ?loc.mode, roots = roots.len(), "location configured");
 
         Self {
+            prefix,
             roots,
-            search_mode: config.search.mode,
-            max_body_size: config.server.max_body_size.as_u64(),
-            max_file_size: config.server.max_file_size.as_u64(),
-            stream_buffer_size: config.server.stream_buffer_size.as_usize(),
+            search_mode: loc.mode,
         }
     }
 
-    /// Search across roots using the configured search mode.
-    ///
-    /// Returns (canonical_path, open File handle, file size).
-    async fn search(&self, request_path: &str) -> Option<(PathBuf, File, u64)> {
+    /// Search across this location's roots using its configured search mode.
+    async fn search(&self, request_path: &str, max_file_size: u64) -> Option<(PathBuf, File, u64)> {
         match self.search_mode {
-            SearchMode::Sequential => self.search_sequential(request_path).await,
-            SearchMode::Concurrent => self.search_concurrent(request_path).await,
-            SearchMode::LatestModified => self.search_latest(request_path).await,
+            SearchMode::Sequential => self.search_sequential(request_path, max_file_size).await,
+            SearchMode::Concurrent => self.search_concurrent(request_path, max_file_size).await,
+            SearchMode::LatestModified => self.search_latest(request_path, max_file_size).await,
         }
     }
 
-    /// Sequential search: check each root in config order; first match wins.
-    async fn search_sequential(&self, request_path: &str) -> Option<(PathBuf, File, u64)> {
+    async fn search_sequential(&self, request_path: &str, max_file_size: u64) -> Option<(PathBuf, File, u64)> {
         let relative = sanitize_path(request_path)?;
 
         let ext = relative
@@ -109,20 +104,17 @@ impl FileSearcher {
             .unwrap_or("");
 
         for root in &self.roots {
-            match Self::try_root(root, &relative, ext, self.max_file_size, request_path).await {
+            match try_root(root, &relative, ext, max_file_size, request_path).await {
                 Ok(Some((path, file, size, _mtime))) => return Some((path, file, size)),
                 Ok(None) => continue,
-                Err(()) => return None, // path traversal — abort
+                Err(()) => return None,
             }
         }
 
         None
     }
 
-    /// Concurrent search: probe all eligible roots at the same time.
-    /// The first root to find a valid file wins; all other tasks are cancelled
-    /// immediately (tokio task drops = automatic cancellation).
-    async fn search_concurrent(&self, request_path: &str) -> Option<(PathBuf, File, u64)> {
+    async fn search_concurrent(&self, request_path: &str, max_file_size: u64) -> Option<(PathBuf, File, u64)> {
         let relative = sanitize_path(request_path)?;
 
         let ext = relative
@@ -144,7 +136,6 @@ impl FileSearcher {
 
             let root_path = root.path.clone();
             let candidate = root.path.join(&relative);
-            let max_file_size = self.max_file_size;
             let req_path = request_path.to_owned();
 
             handles.push(tokio::spawn(
@@ -152,43 +143,11 @@ impl FileSearcher {
             ));
         }
 
-        // Wait for the first successful result; abort remaining tasks.
-        let result = Self::race_handles(handles).await;
+        let result = race_handles(handles).await;
         result.map(|(path, file, size, _mtime)| (path, file, size))
     }
 
-    /// Wait for the first `JoinHandle` that returns `Some`, then abort all
-    /// remaining handles to free resources.
-    async fn race_handles(
-        mut handles: Vec<tokio::task::JoinHandle<Option<(PathBuf, File, u64, SystemTime)>>>,
-    ) -> Option<(PathBuf, File, u64, SystemTime)> {
-        let mut result = None;
-
-        while !handles.is_empty() {
-            let (finished, _index, remaining) = futures_util::future::select_all(handles).await;
-
-            match finished {
-                Ok(Some(found)) => {
-                    result = Some(found);
-                    // Abort all remaining tasks immediately.
-                    for h in remaining {
-                        h.abort();
-                    }
-                    break;
-                }
-                _ => {
-                    // This task returned None or panicked; keep waiting on the rest.
-                    handles = remaining;
-                }
-            }
-        }
-
-        result
-    }
-
-    /// Latest-modified search: check all eligible roots and return the file
-    /// with the most recent modification time.
-    async fn search_latest(&self, request_path: &str) -> Option<(PathBuf, File, u64)> {
+    async fn search_latest(&self, request_path: &str, max_file_size: u64) -> Option<(PathBuf, File, u64)> {
         let relative = sanitize_path(request_path)?;
 
         let ext = relative
@@ -199,7 +158,7 @@ impl FileSearcher {
         let mut best: Option<(PathBuf, File, u64, SystemTime)> = None;
 
         for root in &self.roots {
-            match Self::try_root(root, &relative, ext, self.max_file_size, request_path).await {
+            match try_root(root, &relative, ext, max_file_size, request_path).await {
                 Ok(Some(found)) => {
                     let dominated = best.as_ref().map_or(true, |b| found.3 > b.3);
                     if dominated {
@@ -215,104 +174,97 @@ impl FileSearcher {
                     }
                 }
                 Ok(None) => continue,
-                Err(()) => return None, // path traversal — abort
+                Err(()) => return None,
             }
         }
 
         best.map(|(path, file, size, _mtime)| (path, file, size))
     }
+}
 
-    /// Attempt to find the file under a single search root.
-    ///
-    /// Returns:
-    /// - `Ok(Some(...))` — file found
-    /// - `Ok(None)` — not found in this root, safe to continue
-    /// - `Err(())` — path traversal detected, abort entire search
-    async fn try_root(
-        root: &SearchRoot,
-        relative: &Path,
-        ext: &str,
-        max_file_size: u64,
-        request_path: &str,
-    ) -> Result<Option<(PathBuf, File, u64, SystemTime)>, ()> {
-        if !root.accepts(ext) {
-            debug!(
-                request_path, root = %root.path.display(), ext,
-                "skipped (extension not allowed)"
-            );
-            return Ok(None);
+pub struct FileSearcher {
+    locations: Vec<Location>,
+    max_body_size: u64,
+    max_file_size: u64,
+    stream_buffer_size: usize,
+}
+
+impl FileSearcher {
+    pub fn new(config: &Config) -> Self {
+        let mut locations: Vec<Location> = config
+            .locations
+            .iter()
+            .map(Location::from_config)
+            .collect();
+
+        // Sort by prefix length descending (longest match first).
+        locations.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+
+        Self {
+            locations,
+            max_body_size: config.server.max_body_size.as_u64(),
+            max_file_size: config.server.max_file_size.as_u64(),
+            stream_buffer_size: config.server.stream_buffer_size.as_usize(),
         }
+    }
 
-        let candidate = root.path.join(relative);
-
-        // Resolve symlinks and verify the real path is still inside the root.
-        let canonical = match tokio::fs::canonicalize(&candidate).await {
-            Ok(c) if c.starts_with(&root.path) => c,
-            Ok(_) => {
-                warn!(request_path, "path traversal blocked");
-                return Err(()); // security violation — stop all search
+    /// Match a request path to a location, returning the location and the
+    /// remaining path after stripping the prefix.
+    fn match_location<'a>(&'a self, path: &'a str) -> Option<(&'a Location, &'a str)> {
+        for loc in &self.locations {
+            if loc.prefix == "/" {
+                return Some((loc, path));
             }
-            Err(_) => return Ok(None),
-        };
-
-        // Open file, then obtain metadata from the fd — avoids TOCTOU between
-        // a separate stat() and open().
-        let file = match File::open(&canonical).await {
-            Ok(f) => f,
-            Err(_) => return Ok(None),
-        };
-        let meta = match file.metadata().await {
-            Ok(m) if m.is_file() => m,
-            _ => return Ok(None),
-        };
-
-        if max_file_size > 0 && meta.len() > max_file_size {
-            debug!(
-                request_path, resolved = %canonical.display(),
-                size = meta.len(), limit = max_file_size,
-                "skipped (file too large)"
-            );
-            return Ok(None);
+            if path == loc.prefix {
+                return Some((loc, "/"));
+            }
+            if let Some(rest) = path.strip_prefix(&loc.prefix) {
+                if rest.starts_with('/') {
+                    return Some((loc, rest));
+                }
+            }
         }
+        None
+    }
 
-        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-
-        debug!(
-            request_path, resolved = %canonical.display(),
-            size = meta.len(), "file found"
-        );
-        Ok(Some((canonical, file, meta.len(), modified)))
+    async fn search(&self, request_path: &str) -> Option<(PathBuf, File, u64)> {
+        let (location, stripped_path) = self.match_location(request_path)?;
+        location.search(stripped_path, self.max_file_size).await
     }
 }
 
 // ---------------------------------------------------------------------------
-// Standalone root probe — owns all data, suitable for tokio::spawn
+// Shared search helpers
 // ---------------------------------------------------------------------------
 
-/// Probe a single root directory for a file. Returns `None` on miss or
-/// security violation. Designed to be spawned as an independent task.
-async fn probe_root(
-    root_path: PathBuf,
+/// Core file probe: canonicalize, open, check metadata and size.
+///
+/// Returns:
+/// - `Ok(Some(...))` — file found
+/// - `Ok(None)` — not found or not a regular file
+/// - `Err(())` — path traversal detected (canonical path escaped root)
+async fn probe_candidate(
+    root_path: &Path,
     candidate: PathBuf,
     max_file_size: u64,
-    request_path: String,
-) -> Option<(PathBuf, File, u64, SystemTime)> {
+    request_path: &str,
+) -> Result<Option<(PathBuf, File, u64, SystemTime)>, ()> {
     let canonical = match tokio::fs::canonicalize(&candidate).await {
-        Ok(c) if c.starts_with(&root_path) => c,
+        Ok(c) if c.starts_with(root_path) => c,
         Ok(_) => {
             warn!(request_path, "path traversal blocked");
-            return None;
+            return Err(());
         }
-        Err(_) => return None,
+        Err(_) => return Ok(None),
     };
 
     let file = match File::open(&canonical).await {
         Ok(f) => f,
-        Err(_) => return None,
+        Err(_) => return Ok(None),
     };
     let meta = match file.metadata().await {
         Ok(m) if m.is_file() => m,
-        _ => return None,
+        _ => return Ok(None),
     };
 
     if max_file_size > 0 && meta.len() > max_file_size {
@@ -321,16 +273,75 @@ async fn probe_root(
             size = meta.len(), limit = max_file_size,
             "skipped (file too large)"
         );
-        return None;
+        return Ok(None);
     }
 
     let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
 
     debug!(
         request_path, resolved = %canonical.display(),
-        size = meta.len(), "file found (concurrent)"
+        size = meta.len(), "file found"
     );
-    Some((canonical, file, meta.len(), modified))
+    Ok(Some((canonical, file, meta.len(), modified)))
+}
+
+/// Attempt to find the file under a single search root (with extension filter).
+async fn try_root(
+    root: &SearchRoot,
+    relative: &Path,
+    ext: &str,
+    max_file_size: u64,
+    request_path: &str,
+) -> Result<Option<(PathBuf, File, u64, SystemTime)>, ()> {
+    if !root.accepts(ext) {
+        debug!(
+            request_path, root = %root.path.display(), ext,
+            "skipped (extension not allowed)"
+        );
+        return Ok(None);
+    }
+    probe_candidate(&root.path, root.path.join(relative), max_file_size, request_path).await
+}
+
+/// Wait for the first `JoinHandle` that returns `Some`, then abort all
+/// remaining handles to free resources.
+async fn race_handles(
+    mut handles: Vec<tokio::task::JoinHandle<Option<(PathBuf, File, u64, SystemTime)>>>,
+) -> Option<(PathBuf, File, u64, SystemTime)> {
+    let mut result = None;
+
+    while !handles.is_empty() {
+        let (finished, _index, remaining) = futures_util::future::select_all(handles).await;
+
+        match finished {
+            Ok(Some(found)) => {
+                result = Some(found);
+                for h in remaining {
+                    h.abort();
+                }
+                break;
+            }
+            _ => {
+                handles = remaining;
+            }
+        }
+    }
+
+    result
+}
+
+/// Spawnable probe for a single root — owns all data for `tokio::spawn`.
+/// Extension filtering must be done before calling this.
+async fn probe_root(
+    root_path: PathBuf,
+    candidate: PathBuf,
+    max_file_size: u64,
+    request_path: String,
+) -> Option<(PathBuf, File, u64, SystemTime)> {
+    match probe_candidate(&root_path, candidate, max_file_size, &request_path).await {
+        Ok(found) => found,
+        Err(()) => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
