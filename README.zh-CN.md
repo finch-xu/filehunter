@@ -10,17 +10,18 @@
 
 基于 Rust 构建的高性能多路径文件搜索 HTTP 服务器。
 
-FileHunter 按优先级依次搜索多个配置目录，找到文件后通过分块流式传输返回，未找到则返回 404。适用于文件分布在不同存储路径、需要通过统一端点对外提供服务的场景。
+FileHunter 按 URL 前缀将请求路由到不同的搜索目录组，找到文件后通过分块流式传输返回，未找到则返回 404。适用于文件分布在不同存储路径、需要通过多个 URL 端点对外提供服务的场景。
 
 ## 亮点
 
-- **多路径优先级搜索** — 配置多个根目录，支持顺序或并发两种搜索模式
+- **多前缀 URL 路由** — 每个 `[[locations]]` 将一个 URL 前缀映射到独立的搜索路径和搜索模式
 - **按路径过滤文件类型** — 每个路径可独立限制允许的扩展名（图片、文档、视频等）
+- **三种搜索模式** — sequential（优先级顺序）、concurrent（最快优先）、latest_modified（最新修改时间优先）— 可按 location 独立配置
 - **异步流式传输** — 基于 tokio + hyper 1.x，使用 `ReaderStream` 分块传输，内存占用极低
 - **HTTP/1.1 & HTTP/2** — 通过 `hyper-util` 自动协商协议
-- **安全加固** — 路径穿越防护、TOCTOU 缓解、空字节拒绝、隐藏文件屏蔽、`nosniff` 响应头
+- **安全加固** — 路径穿越防护、TOCTOU 缓解、空字节拒绝、隐藏文件屏蔽、前缀段边界检查、`nosniff` 响应头
 - **人性化配置** — TOML 格式，支持 `"10MB"`、`"64KB"` 等可读单位
-- **极小体积** — 二进制约 3 MB（LTO + strip），空闲 RSS 约 41 MB
+- **极小体积** — 二进制约 3 MB（LTO + strip）
 
 ## 快速开始
 
@@ -49,7 +50,7 @@ docker run -p 8080:8080 \
 
 ## 配置说明
 
-除 `bind` 和 `search.paths` 外，所有字段均为可选，带有合理的默认值。
+除 `bind` 和 `locations` 外，所有字段均为可选，带有合理的默认值。
 
 ```toml
 [server]
@@ -64,44 +65,125 @@ bind = "0.0.0.0:8080"
 # max_file_size = "10MB"          # 0 = 不限制
 # stream_buffer_size = "64KB"
 
-[search]
-# mode = "sequential"             # 或 "concurrent"
+[[locations]]
+prefix = "/imgs"
+mode = "sequential"
 
-[[search.paths]]
+[[locations.paths]]
 root = "/data/images"
 extensions = ["jpg", "jpeg", "png", "gif", "webp", "svg"]
 
-[[search.paths]]
+[[locations]]
+prefix = "/docs"
+mode = "concurrent"
+
+[[locations.paths]]
 root = "/data/documents"
 extensions = ["pdf", "docx", "xlsx", "txt", "csv"]
 
-[[search.paths]]
+[[locations.paths]]
+root = "/data/archive"
+extensions = ["pdf", "docx", "xlsx", "txt", "csv"]
+
+[[locations]]
+prefix = "/"
+
+[[locations.paths]]
 root = "/data/general"
 # 不限扩展名 — 作为兜底路径接受所有文件类型
 ```
 
-### 搜索机制
+### 路由机制
 
-以请求 `/report.pdf` 为例：
+每个 `[[locations]]` 块将一个 URL 前缀映射到一组搜索路径。请求到达时，FileHunter 匹配最长前缀，剥离前缀后在该 location 的路径中搜索文件。
 
-1. 检查 `/data/images` — 跳过（`.pdf` 不在允许的扩展名中）
-2. 检查 `/data/documents` — 在 `/data/documents/report.pdf` **找到** → 返回文件
-3. 若上一步未找到，继续检查 `/data/general`
+**示例**（使用上述配置）：
+
+| 请求 | 匹配的 location | 搜索内容 | 结果 |
+|---|---|---|---|
+| `GET /imgs/photo.jpg` | `prefix="/imgs"` | 在 `/data/images` 中搜索 `photo.jpg` | 顺序搜索 |
+| `GET /docs/report.pdf` | `prefix="/docs"` | 在 `/data/documents`、`/data/archive` 中搜索 `report.pdf` | 并发搜索 |
+| `GET /other/file.txt` | `prefix="/"` | 在 `/data/general` 中搜索 `other/file.txt` | 兜底匹配 |
+| `GET /imgs` | `prefix="/imgs"` | `/` → 路径校验拒绝 → 404 | 无文件可服务 |
+
+**前缀匹配规则：**
+
+- 最长前缀优先：若同时配置了 `/api/v1` 和 `/api`，请求 `/api/v1/data` 匹配 `/api/v1`
+- 段边界匹配：`/imgs` 不会匹配 `/imgs-extra/file.jpg`（剥离后剩余部分必须以 `/` 开头）
+- `prefix="/"` 作为兜底，匹配所有未被其他前缀捕获的请求
+- 未匹配任何前缀的请求返回 404
+
+### 不同路由配置下的行为
+
+#### 仅配置根路由（`prefix="/"`）
+
+只配置 `prefix="/"` 时，所有请求由同一个 location 处理 — 等同于最简单的扁平搜索：
+
+```toml
+[[locations]]
+prefix = "/"
+
+[[locations.paths]]
+root = "/data/files"
+```
+
+| 请求 | 匹配 | 剥离后路径 | 行为 |
+|---|---|---|---|
+| `GET /photo.jpg` | `"/"` | `/photo.jpg` | 在 `/data/files` 中搜索 `photo.jpg` |
+| `GET /sub/dir/file.txt` | `"/"` | `/sub/dir/file.txt` | 在 `/data/files` 中搜索 `sub/dir/file.txt` |
+| `GET /` | `"/"` | `/` | 路径清理拒绝空路径 → **404** |
+| `GET /../etc/passwd` | `"/"` | `/../etc/passwd` | 路径清理拒绝 `..` → **404** |
+| `GET /.env` | `"/"` | `/.env` | 路径清理拒绝隐藏文件 → **404** |
+
+#### 配置多前缀路由
+
+配置多个前缀时，每个请求被路由到最佳匹配的 location：
+
+```toml
+[[locations]]
+prefix = "/imgs"
+
+[[locations.paths]]
+root = "/data/images"
+extensions = ["jpg", "png"]
+
+[[locations]]
+prefix = "/api/v1"
+
+[[locations.paths]]
+root = "/data/api-v1"
+
+[[locations]]
+prefix = "/api"
+
+[[locations.paths]]
+root = "/data/api-legacy"
+```
+
+| 请求 | 匹配 | 剥离后路径 | 行为 |
+|---|---|---|---|
+| `GET /imgs/photo.jpg` | `"/imgs"` | `/photo.jpg` | 在 `/data/images` 中搜索 `photo.jpg` |
+| `GET /imgs/sub/pic.png` | `"/imgs"` | `/sub/pic.png` | 在 `/data/images` 中搜索 `sub/pic.png` |
+| `GET /imgs` | `"/imgs"` | `/` | 路径清理拒绝空路径 → **404** |
+| `GET /imgs/` | `"/imgs"` | `/` | 路径清理拒绝空路径 → **404** |
+| `GET /imgs-hd/photo.jpg` | — | — | 非段边界，无前缀匹配 → **404** |
+| `GET /api/v1/users.json` | `"/api/v1"` | `/users.json` | 最长前缀优先 → 在 `/data/api-v1` 中搜索 |
+| `GET /api/v2/data.json` | `"/api"` | `/v2/data.json` | 回退到 `/api` → 在 `/data/api-legacy` 中搜索 |
+| `GET /api` | `"/api"` | `/` | 路径清理拒绝空路径 → **404** |
+| `GET /other/file.txt` | — | — | 无前缀匹配，无兜底路由 → **404** |
+| `GET /%69mgs/photo.jpg` | — | — | 原始路径不匹配 `/imgs` → **404** |
+
+> **注意：** 未配置 `prefix="/"` 兜底路由时，任何不匹配已配置前缀的请求直接返回 404。
 
 ### 搜索模式
 
-通过 `search.mode` 控制多个根目录的搜索方式：
+每个 location 通过 `mode` 字段独立配置搜索模式：
 
 | 模式 | 行为 |
 |---|---|
 | `sequential`（默认） | 按配置顺序逐个检查根目录，第一个匹配即返回。行为确定 — 配置顺序决定优先级。 |
 | `concurrent` | 同时探测所有符合条件的根目录，最快找到文件的立即响应。其余搜索任务立刻取消以释放资源。 |
 | `latest_modified` | 检查所有根目录，返回**修改时间最新**的文件。每次请求都会遍历所有根目录，确保返回最新版本。 |
-
-```toml
-[search]
-mode = "latest_modified"  # 或 "sequential"（默认）/ "concurrent"
-```
 
 **模式对比**（N = 符合条件的根目录数量）：
 
@@ -116,36 +198,21 @@ mode = "latest_modified"  # 或 "sequential"（默认）/ "concurrent"
 | **结果确定性** | 由配置顺序决定 | 不确定（取决于 I/O 速度） | 确定（由 mtime 决定） |
 | **适用场景** | 通用，优先级控制 | 高延迟网络挂载 | 镜像存储 / 分级存储 |
 
-**基准测试**（3 条搜索路径，本地 SSD，release 构建）：
-
-| 指标 | `sequential` | `concurrent` | `latest_modified` |
-|---|---|---|---|
-| 单请求延迟 (1 KB) | 0.54 ms | 0.62 ms | 0.83 ms |
-| 单请求延迟 (1 MB) | 1.18 ms | 1.29 ms | 1.65 ms |
-| 50 并发总耗时 (1 KB) | 164.16 ms | 164.68 ms | 232.44 ms |
-| 50 并发总耗时 (1 MB) | 201.39 ms | 217.09 ms | 189.22 ms |
-| 空闲内存 (RSS) | 3.36 MB | 3.50 MB | 3.36 MB |
-| 峰值内存 (RSS) | 11.06 MB | 12.33 MB | 10.53 MB |
-| 峰值 CPU 占用 | 12.0% | 8.4% | 9.1% |
-
-> 运行 `bash bench/bench_modes.sh` 复现。
-
 ### 子目录支持
 
-请求路径可以包含任意深度的子目录。完整的相对路径会直接拼接到每个搜索根目录后面 — 服务器不会按文件名递归搜索。
+请求路径可以包含任意深度的子目录。前缀剥离后的相对路径会直接拼接到每个搜索根目录后面 — 服务器不会按文件名递归搜索。
 
-**示例：** 假设使用上述配置，且文件位于 `/data/images/photos/2024/vacation/beach.jpg`：
+**示例：** 假设配置了 `prefix="/imgs"`，根目录为 `/data/images`，文件位于 `/data/images/photos/2024/vacation/beach.jpg`：
 
 ```
-GET /photos/2024/vacation/beach.jpg
+GET /imgs/photos/2024/vacation/beach.jpg
 
-1. 路径清理  → photos/2024/vacation/beach.jpg   （去掉前导 /，逐段校验）
-2. 拼接根目录 → /data/images/photos/2024/vacation/beach.jpg
-3. 安全校验  → 解析符号链接 + 确认路径仍在 /data/images 内
-4. 返回文件  → 200 OK（分块流式传输）
+1. 前缀匹配  → prefix="/imgs"，剥离 → /photos/2024/vacation/beach.jpg
+2. 路径清理  → photos/2024/vacation/beach.jpg   （去掉前导 /，逐段校验）
+3. 拼接根目录 → /data/images/photos/2024/vacation/beach.jpg
+4. 安全校验  → 解析符号链接 + 确认路径仍在 /data/images 内
+5. 返回文件  → 200 OK（分块流式传输）
 ```
-
-如果在 `/data/images` 下未找到该路径，服务器会继续尝试下一个根目录（`/data/documents`、`/data/general` 等）。
 
 **要点：**
 
@@ -169,50 +236,10 @@ FileHunter 使用 `tracing`，支持环境变量控制日志级别：
 RUST_LOG=filehunter=debug ./filehunter --config config.toml
 ```
 
-## 运行时资源使用
-
-> 测试环境：release 构建（LTO + strip），配置 4 条搜索路径（images / documents / videos / general），默认参数。
-
-### 二进制与进程
-
-| 指标 | 数值 |
-|---|---|
-| 二进制体积 | **~3 MB** |
-| 空闲 VmSize | ~1,071 MB |
-| 空闲 VmRSS | **~41 MB** |
-| 空闲线程数 | 17 |
-| 空闲打开文件描述符 | 10 |
-
-### 内存（负载前后对比）
-
-| 阶段 | VmRSS | 线程数 | 打开 FD |
-|---|---|---|---|
-| 空闲 | 41 MB | 17 | 10 |
-| 200 并发混合请求后 | 59 MB | 25 | 10 |
-
-> 内存在负载下保持平稳 — 异步流式传输设计避免将整个文件缓冲到内存中，高并发大文件传输后 RSS 仅增长约 18 MB，FD 数量不变。
-
-### 单请求延迟
-
-| 文件类型 | 大小 | 平均延迟 |
-|---|---|---|
-| 纯文本 | 11 B | ~1.8 ms |
-| 图片（JPG） | 500 KB | ~2.8 ms |
-| 文档（PDF） | 800 KB | ~3.5 ms |
-| 视频（MP4） | 5 MB | ~13.9 ms |
-| 二进制文件 | 5 MB | ~12.9 ms |
-
-### 并发吞吐
-
-| 场景 | 总耗时 |
-|---|---|
-| 50 并发 × 小文件 (11 B) | ~495 ms |
-| 50 并发 × 图片 (500 KB) | ~451 ms |
-| 10 并发 × 视频 (5 MB) | ~181 ms |
-| 200 并发 × 混合文件 | ~1.8 s |
-
 ## 安全特性
 
+- 前缀段边界匹配（防止 `/imgs` 误匹配 `/imgs-extra/`）
+- 前缀在 percent-decode 之前剥离（编码路径无法绕过前缀匹配）
 - 路径穿越拦截（`.` / `..` / 符号链接逃逸）
 - 空字节注入拒绝
 - 隐藏文件和目录（dotfiles）屏蔽
@@ -220,6 +247,7 @@ RUST_LOG=filehunter=debug ./filehunter --config config.toml
 - 连接超时防护 slow-loris 攻击
 - 请求大小限制（头部 + 正文）
 - 文件大小限制，防止意外提供超大文件
+- 配置校验：规范化后重复前缀被拒绝
 
 ## 许可证
 

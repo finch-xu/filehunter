@@ -10,17 +10,18 @@
 
 A high-performance, multi-path file search HTTP server built with Rust.
 
-FileHunter searches across multiple configured directories in priority order, serves the first match via chunked streaming, and returns 404 if nothing is found. Designed for scenarios where files are spread across different storage paths and need to be served through a single endpoint.
+FileHunter routes requests by URL prefix to different groups of search directories, serves the first match via chunked streaming, and returns 404 if nothing is found. Designed for scenarios where files are spread across different storage paths and need to be served through organized URL endpoints.
 
 ## Highlights
 
-- **Multi-path priority search** — configure multiple root directories; first match wins (sequential or concurrent mode)
+- **Multi-prefix URL routing** — each `[[locations]]` maps a URL prefix to its own set of search paths and search mode
 - **Per-path extension filtering** — restrict each path to specific file types (images, documents, videos, etc.)
+- **Three search modes** — sequential (priority order), concurrent (fastest wins), latest_modified (newest mtime wins) — configurable per location
 - **Async streaming** — built on tokio + hyper 1.x with chunked `ReaderStream` for low memory usage
 - **HTTP/1.1 & HTTP/2** — automatic protocol negotiation via `hyper-util`
-- **Security hardened** — path traversal protection, TOCTOU mitigation, null byte rejection, dotfile blocking, `nosniff` headers
+- **Security hardened** — path traversal protection, TOCTOU mitigation, null byte rejection, dotfile blocking, prefix segment-boundary checks, `nosniff` headers
 - **Human-friendly config** — TOML format with size values like `"10MB"`, `"64KB"`
-- **Tiny footprint** — ~3 MB binary (LTO + strip), ~41 MB RSS at idle
+- **Tiny footprint** — ~3 MB binary (LTO + strip)
 
 ## Quick Start
 
@@ -49,7 +50,7 @@ docker run -p 8080:8080 \
 
 ## Configuration
 
-All fields except `bind` and `search.paths` are optional with sensible defaults.
+All fields except `bind` and `locations` are optional with sensible defaults.
 
 ```toml
 [server]
@@ -64,44 +65,125 @@ bind = "0.0.0.0:8080"
 # max_file_size = "10MB"          # 0 = no limit
 # stream_buffer_size = "64KB"
 
-[search]
-# mode = "sequential"             # or "concurrent"
+[[locations]]
+prefix = "/imgs"
+mode = "sequential"
 
-[[search.paths]]
+[[locations.paths]]
 root = "/data/images"
 extensions = ["jpg", "jpeg", "png", "gif", "webp", "svg"]
 
-[[search.paths]]
+[[locations]]
+prefix = "/docs"
+mode = "concurrent"
+
+[[locations.paths]]
 root = "/data/documents"
 extensions = ["pdf", "docx", "xlsx", "txt", "csv"]
 
-[[search.paths]]
+[[locations.paths]]
+root = "/data/archive"
+extensions = ["pdf", "docx", "xlsx", "txt", "csv"]
+
+[[locations]]
+prefix = "/"
+
+[[locations.paths]]
 root = "/data/general"
 # No extensions — accepts any file type as a catch-all.
 ```
 
-### How Search Works
+### How Routing Works
 
-Given a request for `/report.pdf`:
+Each `[[locations]]` block maps a URL prefix to a group of search paths. When a request arrives, FileHunter finds the longest matching prefix, strips it, and searches within that location's paths.
 
-1. Check `/data/images` — skipped (`.pdf` not in allowed extensions)
-2. Check `/data/documents` — **found** at `/data/documents/report.pdf` → serve it
-3. `/data/general` would be checked next if not found above
+**Example** with the config above:
 
-### Search Mode
+| Request | Matched location | Searched as | Result |
+|---|---|---|---|
+| `GET /imgs/photo.jpg` | `prefix="/imgs"` | `photo.jpg` in `/data/images` | Sequential search |
+| `GET /docs/report.pdf` | `prefix="/docs"` | `report.pdf` in `/data/documents`, `/data/archive` | Concurrent search |
+| `GET /other/file.txt` | `prefix="/"` | `other/file.txt` in `/data/general` | Catch-all |
+| `GET /imgs` | `prefix="/imgs"` | `/` → sanitize rejects → 404 | No file to serve |
 
-Control how multiple roots are probed via `search.mode`:
+**Prefix matching rules:**
+
+- Longest prefix wins: if you have `/api/v1` and `/api`, a request to `/api/v1/data` matches `/api/v1`
+- Segment boundary: `/imgs` does NOT match `/imgs-extra/file.jpg` (the remainder must start with `/`)
+- `prefix="/"` acts as a catch-all for unmatched requests
+- Requests matching no prefix return 404
+
+### Routing Behavior by Configuration
+
+#### Single catch-all location (`prefix="/"`)
+
+When only `prefix="/"` is configured, all requests are handled by one location — equivalent to the simplest flat search setup:
+
+```toml
+[[locations]]
+prefix = "/"
+
+[[locations.paths]]
+root = "/data/files"
+```
+
+| Request | Matched | Stripped path | Behavior |
+|---|---|---|---|
+| `GET /photo.jpg` | `"/"` | `/photo.jpg` | Search `photo.jpg` in `/data/files` |
+| `GET /sub/dir/file.txt` | `"/"` | `/sub/dir/file.txt` | Search `sub/dir/file.txt` in `/data/files` |
+| `GET /` | `"/"` | `/` | sanitize rejects empty path → **404** |
+| `GET /../etc/passwd` | `"/"` | `/../etc/passwd` | sanitize rejects `..` → **404** |
+| `GET /.env` | `"/"` | `/.env` | sanitize rejects dotfile → **404** |
+
+#### Multiple prefixes
+
+When multiple prefixes are configured, each request is routed to the best-matching location:
+
+```toml
+[[locations]]
+prefix = "/imgs"
+
+[[locations.paths]]
+root = "/data/images"
+extensions = ["jpg", "png"]
+
+[[locations]]
+prefix = "/api/v1"
+
+[[locations.paths]]
+root = "/data/api-v1"
+
+[[locations]]
+prefix = "/api"
+
+[[locations.paths]]
+root = "/data/api-legacy"
+```
+
+| Request | Matched | Stripped path | Behavior |
+|---|---|---|---|
+| `GET /imgs/photo.jpg` | `"/imgs"` | `/photo.jpg` | Search `photo.jpg` in `/data/images` |
+| `GET /imgs/sub/pic.png` | `"/imgs"` | `/sub/pic.png` | Search `sub/pic.png` in `/data/images` |
+| `GET /imgs` | `"/imgs"` | `/` | sanitize rejects empty path → **404** |
+| `GET /imgs/` | `"/imgs"` | `/` | sanitize rejects empty path → **404** |
+| `GET /imgs-hd/photo.jpg` | — | — | No prefix match (not segment boundary) → **404** |
+| `GET /api/v1/users.json` | `"/api/v1"` | `/users.json` | Longest match wins → search in `/data/api-v1` |
+| `GET /api/v2/data.json` | `"/api"` | `/v2/data.json` | Falls back to `/api` → search in `/data/api-legacy` |
+| `GET /api` | `"/api"` | `/` | sanitize rejects empty path → **404** |
+| `GET /other/file.txt` | — | — | No prefix match, no catch-all → **404** |
+| `GET /%69mgs/photo.jpg` | — | — | Raw path doesn't match `/imgs` → **404** |
+
+> **Note:** Without a `prefix="/"` catch-all, any request that doesn't match a configured prefix returns 404 immediately.
+
+### Search Modes
+
+Each location has its own search mode via the `mode` field:
 
 | Mode | Behavior |
 |---|---|
 | `sequential` (default) | Check each root one-by-one in config order. First match wins. Deterministic — config order defines priority. |
 | `concurrent` | Probe all eligible roots at the same time. The fastest match wins. Remaining searches are cancelled immediately to free resources. |
 | `latest_modified` | Check all roots and return the file with the **most recent modification time**. All roots are always checked so the newest version wins. |
-
-```toml
-[search]
-mode = "latest_modified"  # or "sequential" (default) / "concurrent"
-```
 
 **Mode comparison** (N = number of eligible roots):
 
@@ -116,36 +198,21 @@ mode = "latest_modified"  # or "sequential" (default) / "concurrent"
 | **Result determinism** | Config order | Non-deterministic | Deterministic (by mtime) |
 | **Best for** | General use, priority control | High-latency network mounts | Mirrored / staged storage |
 
-**Benchmark** (3 search paths, local SSD, release build):
-
-| Metric | `sequential` | `concurrent` | `latest_modified` |
-|---|---|---|---|
-| Single-request latency (1 KB) | 0.54 ms | 0.62 ms | 0.83 ms |
-| Single-request latency (1 MB) | 1.18 ms | 1.29 ms | 1.65 ms |
-| 50 concurrent total time (1 KB) | 164.16 ms | 164.68 ms | 232.44 ms |
-| 50 concurrent total time (1 MB) | 201.39 ms | 217.09 ms | 189.22 ms |
-| Idle memory (RSS) | 3.36 MB | 3.50 MB | 3.36 MB |
-| Peak memory (RSS) | 11.06 MB | 12.33 MB | 10.53 MB |
-| Peak CPU usage | 12.0% | 8.4% | 9.1% |
-
-> Run `bash bench/bench_modes.sh` to reproduce.
-
 ### Subdirectory Support
 
-Request paths can contain subdirectories of any depth. The full relative path is joined directly to each search root — there is no recursive filename search.
+Request paths can contain subdirectories of any depth. The full relative path (after prefix stripping) is joined directly to each search root — there is no recursive filename search.
 
-**Example:** given the config above and a file at `/data/images/photos/2024/vacation/beach.jpg`:
+**Example:** given `prefix="/imgs"` with root `/data/images`, and a file at `/data/images/photos/2024/vacation/beach.jpg`:
 
 ```
-GET /photos/2024/vacation/beach.jpg
+GET /imgs/photos/2024/vacation/beach.jpg
 
-1. sanitize  → photos/2024/vacation/beach.jpg   (strip leading /, validate each segment)
-2. root join → /data/images/photos/2024/vacation/beach.jpg
-3. security  → canonicalize + verify path is still inside /data/images
-4. serve     → 200 OK (chunked stream)
+1. match     → prefix="/imgs", strip → /photos/2024/vacation/beach.jpg
+2. sanitize  → photos/2024/vacation/beach.jpg   (strip leading /, validate each segment)
+3. root join → /data/images/photos/2024/vacation/beach.jpg
+4. security  → canonicalize + verify path is still inside /data/images
+5. serve     → 200 OK (chunked stream)
 ```
-
-If the same path is not found under `/data/images`, the server continues to the next root (`/data/documents`, then `/data/general`, etc.).
 
 **Key points:**
 
@@ -169,50 +236,10 @@ FileHunter uses `tracing` with env-filter support:
 RUST_LOG=filehunter=debug ./filehunter --config config.toml
 ```
 
-## Runtime Resource Usage
-
-> Test environment: release build (LTO + strip), 4 search paths configured (images / documents / videos / general), default parameters.
-
-### Binary & Process
-
-| Metric | Value |
-|---|---|
-| Binary size | **~3 MB** |
-| Idle VmSize | ~1,071 MB |
-| Idle VmRSS | **~41 MB** |
-| Idle threads | 17 |
-| Idle open file descriptors | 10 |
-
-### Memory (before / after load)
-
-| Phase | VmRSS | Threads | Open FDs |
-|---|---|---|---|
-| Idle | 41 MB | 17 | 10 |
-| After 200 concurrent mixed requests | 59 MB | 25 | 10 |
-
-> Memory stays flat under load — the async streaming design avoids buffering entire files into memory. RSS grows only ~18 MB after heavy concurrent large-file transfers, and the FD count remains unchanged.
-
-### Single-Request Latency
-
-| File type | Size | Avg latency |
-|---|---|---|
-| Plain text | 11 B | ~1.8 ms |
-| Image (JPG) | 500 KB | ~2.8 ms |
-| Document (PDF) | 800 KB | ~3.5 ms |
-| Video (MP4) | 5 MB | ~13.9 ms |
-| Binary | 5 MB | ~12.9 ms |
-
-### Concurrent Throughput
-
-| Scenario | Total time |
-|---|---|
-| 50 concurrent × small file (11 B) | ~495 ms |
-| 50 concurrent × image (500 KB) | ~451 ms |
-| 10 concurrent × video (5 MB) | ~181 ms |
-| 200 concurrent × mixed files | ~1.8 s |
-
 ## Security
 
+- Prefix segment-boundary matching (prevents `/imgs` from matching `/imgs-extra/`)
+- Prefix stripped before percent-decoding (encoded path components can't bypass prefix matching)
 - Path traversal blocked (`.` / `..` / symlink escape)
 - Null bytes rejected
 - Hidden files and directories (dotfiles) blocked
@@ -220,6 +247,7 @@ RUST_LOG=filehunter=debug ./filehunter --config config.toml
 - Connection timeout protection against slow-loris attacks
 - Request size limits (headers + body)
 - File size limit to prevent serving unexpectedly large files
+- Config validation: duplicate prefixes rejected after normalization
 
 ## License
 
