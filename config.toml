@@ -1,0 +1,63 @@
+[server]
+bind = "0.0.0.0:8080"
+
+# --- All fields below are optional (shown values are defaults) ---
+
+# Enable HTTP/1.1 keep-alive.
+# keepalive = true
+
+# Maximum connection lifetime in seconds (0 = unlimited).
+# Protects against slow-loris and idle connections.
+# connection_timeout = 300
+
+# Maximum size for the request line + headers.
+# Supports: "8KB", "16KB", or raw bytes like 8192
+# max_header_size = "8KB"
+
+# Maximum number of request headers.
+# max_headers = 64
+
+# Maximum allowed Content-Length. Requests exceeding this get 413.
+# Supports: "1MB", "512KB", "2GB", or raw bytes like 1048576
+# max_body_size = "1MB"
+
+# HTTP/2 maximum concurrent streams per connection.
+# http2_max_streams = 128
+
+# Maximum file size that can be served. Files exceeding this are skipped.
+# Set to 0 to disable the limit.
+# Supports: "10MB", "100MB", "1GB", or raw bytes
+# max_file_size = "10MB"
+
+# Response streaming buffer size.
+# Supports: "64KB", "128KB", or raw bytes like 65536
+# stream_buffer_size = "64KB"
+
+[search]
+# Search mode: "sequential" (default), "concurrent", or "latest_modified".
+#   sequential      — check roots one-by-one in config order; first match wins.
+#   concurrent      — probe all eligible roots at the same time; fastest match wins,
+#                     remaining searches are cancelled immediately.
+#   latest_modified — check all roots and return the file with the most recent
+#                     modification time.
+# mode = "sequential"
+
+# Search paths in priority order (sequential) or candidate pool (concurrent).
+# Each entry has a root directory and an optional extensions filter.
+# If extensions is omitted or empty, all file types are allowed.
+
+[[search.paths]]
+root = "/data/images"
+extensions = ["jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "ico"]
+
+[[search.paths]]
+root = "/data/documents"
+extensions = ["pdf", "docx", "xlsx", "pptx", "doc", "xls", "ppt", "txt", "csv"]
+
+[[search.paths]]
+root = "/data/videos"
+extensions = ["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm"]
+
+[[search.paths]]
+root = "/data/general"
+# No extensions filter — accepts any file type as a catch-all fallback.

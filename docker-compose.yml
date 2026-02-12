@@ -1,0 +1,15 @@
+services:
+  filehunter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: filehunter:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.toml:/etc/filehunter/config.toml:ro
+      - /data/images:/data/images:ro
+      - /data/documents:/data/documents:ro
+      - /data/videos:/data/videos:ro
+      - /data/general:/data/general:ro
+    restart: unless-stopped
