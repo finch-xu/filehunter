@@ -2,7 +2,7 @@
 name = "filehunter"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.93"
 license = "MIT"
 description = "High-performance multi-path file search HTTP server"
 
