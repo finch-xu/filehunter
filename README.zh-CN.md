@@ -8,6 +8,10 @@
   <a href="README.md">English</a>
 </p>
 
+<p align="center">
+  <img src="Logic-diagram.jpg" alt="FileHunter 逻辑示意图">
+</p>
+
 基于 Rust 构建的高性能多路径文件搜索 HTTP 服务器。
 
 FileHunter 按 URL 前缀将请求路由到不同的搜索目录组，找到文件后通过分块流式传输返回，未找到则返回 404。适用于文件分布在不同存储路径、需要通过多个 URL 端点对外提供服务的场景。

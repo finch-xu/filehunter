@@ -8,6 +8,10 @@
   <a href="README.zh-CN.md">中文</a>
 </p>
 
+<p align="center">
+  <img src="Logic-diagram.jpg" alt="FileHunter Logic Diagram">
+</p>
+
 A high-performance, multi-path file search HTTP server built with Rust.
 
 FileHunter routes requests by URL prefix to different groups of search directories, serves the first match via chunked streaming, and returns 404 if nothing is found. Designed for scenarios where files are spread across different storage paths and need to be served through organized URL endpoints.
