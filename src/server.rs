@@ -278,10 +278,6 @@ async fn probe_candidate(
 
     let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
 
-    debug!(
-        request_path, resolved = %canonical.display(),
-        size = meta.len(), "file found"
-    );
     Ok(Some((canonical, file, meta.len(), modified)))
 }
 
@@ -391,6 +387,7 @@ pub async fn handle_request(
     searcher: Arc<FileSearcher>,
 ) -> Result<Response<ResponseBody>, Infallible> {
     if req.method() != Method::GET && req.method() != Method::HEAD {
+        debug!(status = 405, method = %req.method(), "request handled");
         return Ok(text_response(
             StatusCode::METHOD_NOT_ALLOWED,
             "Method Not Allowed",
@@ -405,6 +402,7 @@ pub async fn handle_request(
             .and_then(|s| s.parse().ok())
             .unwrap_or(u64::MAX); // treat unparseable as oversized → 413
         if len > searcher.max_body_size {
+            debug!(status = 413, path = %req.uri().path(), "request handled");
             return Ok(text_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Payload Too Large",
@@ -417,6 +415,11 @@ pub async fn handle_request(
 
     match searcher.search(path).await {
         Some((file_path, file, size)) => {
+            debug!(
+                status = 200, path,
+                resolved = %file_path.display(), size,
+                "request handled"
+            );
             let mime = mime_guess::from_path(&file_path).first_or_octet_stream();
 
             let body = if is_head {
@@ -434,7 +437,10 @@ pub async fn handle_request(
                 .body(body)
                 .unwrap())
         }
-        None => Ok(text_response(StatusCode::NOT_FOUND, "Not Found")),
+        None => {
+            debug!(status = 404, path, "request handled");
+            Ok(text_response(StatusCode::NOT_FOUND, "Not Found"))
+        }
     }
 }
 
