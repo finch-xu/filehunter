@@ -72,9 +72,9 @@ bind = "0.0.0.0:8080"
 # connection_timeout = 300        # seconds, 0 = unlimited
 # max_header_size = "8KB"
 # max_headers = 64
-# max_body_size = "1MB"
+max_body_size = "10MB"
 # http2_max_streams = 128
-# max_file_size = "10MB"          # 0 = no limit
+max_file_size = "10MB"          # 0 = no limit
 # stream_buffer_size = "64KB"
 
 [[locations]]
