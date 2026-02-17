@@ -4,7 +4,13 @@
 
 <h1 align="center">FileHunter</h1>
 
-[![CodeQL](https://github.com/finch-xu/filehunter/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/finch-xu/filehunter/actions/workflows/github-code-scanning/codeql)
+<p align="center">
+  <a href="https://github.com/finch-xu/filehunter/releases/latest"><img src="https://img.shields.io/github/v/release/finch-xu/filehunter" alt="Release"></a>
+  <a href="https://github.com/finch-xu/filehunter/blob/main/LICENSE"><img src="https://img.shields.io/github/license/finch-xu/filehunter" alt="License"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.93%2B-orange?logo=rust" alt="Rust 1.93+"></a>
+  <a href="https://github.com/finch-xu/filehunter/pkgs/container/filehunter"><img src="https://img.shields.io/badge/ghcr.io-filehunter-blue?logo=docker" alt="Docker"></a>
+  <a href="https://github.com/finch-xu/filehunter/actions/workflows/github-code-scanning/codeql"><img src="https://github.com/finch-xu/filehunter/actions/workflows/github-code-scanning/codeql/badge.svg" alt="CodeQL"></a>
+</p>
 
 <p align="center">
   <a href="README.zh-CN.md">中文</a>
