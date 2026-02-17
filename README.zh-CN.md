@@ -39,6 +39,8 @@ FileHunter 按 URL 前缀将请求路由到不同的搜索目录组，找到文�
 
 ### 源码编译
 
+> **环境要求：** Rust 1.93+（Edition 2024）
+
 ```bash
 cargo build --release
 ./target/release/filehunter --config config.toml

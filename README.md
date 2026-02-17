@@ -39,6 +39,8 @@ FileHunter routes requests by URL prefix to different groups of search directori
 
 ### From Source
 
+> **Requires:** Rust 1.93+ (Edition 2024)
+
 ```bash
 cargo build --release
 ./target/release/filehunter --config config.toml
