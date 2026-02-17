@@ -38,11 +38,17 @@ struct Location {
     prefix: String,
     roots: Vec<SearchRoot>,
     search_mode: SearchMode,
+    max_file_size: u64,
 }
 
 impl Location {
-    fn from_config(loc: &LocationConfig) -> Self {
+    fn from_config(loc: &LocationConfig, server_max_file_size: u64) -> Self {
         let prefix = normalize_prefix(&loc.prefix);
+
+        let max_file_size = loc
+            .max_file_size
+            .map(|bs| bs.as_u64())
+            .unwrap_or(server_max_file_size);
 
         let roots: Vec<SearchRoot> = loc
             .paths
@@ -77,25 +83,30 @@ impl Location {
             warn!(prefix = %prefix, "no valid search paths for location");
         }
 
-        info!(prefix = %prefix, mode = ?loc.mode, roots = roots.len(), "location configured");
+        info!(
+            prefix = %prefix, mode = ?loc.mode, roots = roots.len(),
+            max_file_size = %crate::config::ByteSize(max_file_size),
+            "location configured"
+        );
 
         Self {
             prefix,
             roots,
             search_mode: loc.mode,
+            max_file_size,
         }
     }
 
     /// Search across this location's roots using its configured search mode.
-    async fn search(&self, request_path: &str, max_file_size: u64) -> Option<(PathBuf, File, u64)> {
+    async fn search(&self, request_path: &str) -> Option<(PathBuf, File, u64)> {
         match self.search_mode {
-            SearchMode::Sequential => self.search_sequential(request_path, max_file_size).await,
-            SearchMode::Concurrent => self.search_concurrent(request_path, max_file_size).await,
-            SearchMode::LatestModified => self.search_latest(request_path, max_file_size).await,
+            SearchMode::Sequential => self.search_sequential(request_path).await,
+            SearchMode::Concurrent => self.search_concurrent(request_path).await,
+            SearchMode::LatestModified => self.search_latest(request_path).await,
         }
     }
 
-    async fn search_sequential(&self, request_path: &str, max_file_size: u64) -> Option<(PathBuf, File, u64)> {
+    async fn search_sequential(&self, request_path: &str) -> Option<(PathBuf, File, u64)> {
         let relative = sanitize_path(request_path)?;
 
         let ext = relative
@@ -104,7 +115,7 @@ impl Location {
             .unwrap_or("");
 
         for root in &self.roots {
-            match try_root(root, &relative, ext, max_file_size, request_path).await {
+            match try_root(root, &relative, ext, self.max_file_size, request_path).await {
                 Ok(Some((path, file, size, _mtime))) => return Some((path, file, size)),
                 Ok(None) => continue,
                 Err(()) => return None,
@@ -114,7 +125,7 @@ impl Location {
         None
     }
 
-    async fn search_concurrent(&self, request_path: &str, max_file_size: u64) -> Option<(PathBuf, File, u64)> {
+    async fn search_concurrent(&self, request_path: &str) -> Option<(PathBuf, File, u64)> {
         let relative = sanitize_path(request_path)?;
 
         let ext = relative
@@ -136,6 +147,7 @@ impl Location {
 
             let root_path = root.path.clone();
             let candidate = root.path.join(&relative);
+            let max_file_size = self.max_file_size;
             let req_path = request_path.to_owned();
 
             handles.push(tokio::spawn(
@@ -147,7 +159,7 @@ impl Location {
         result.map(|(path, file, size, _mtime)| (path, file, size))
     }
 
-    async fn search_latest(&self, request_path: &str, max_file_size: u64) -> Option<(PathBuf, File, u64)> {
+    async fn search_latest(&self, request_path: &str) -> Option<(PathBuf, File, u64)> {
         let relative = sanitize_path(request_path)?;
 
         let ext = relative
@@ -158,7 +170,7 @@ impl Location {
         let mut best: Option<(PathBuf, File, u64, SystemTime)> = None;
 
         for root in &self.roots {
-            match try_root(root, &relative, ext, max_file_size, request_path).await {
+            match try_root(root, &relative, ext, self.max_file_size, request_path).await {
                 Ok(Some(found)) => {
                     let dominated = best.as_ref().map_or(true, |b| found.3 > b.3);
                     if dominated {
@@ -185,16 +197,17 @@ impl Location {
 pub struct FileSearcher {
     locations: Vec<Location>,
     max_body_size: u64,
-    max_file_size: u64,
     stream_buffer_size: usize,
 }
 
 impl FileSearcher {
     pub fn new(config: &Config) -> Self {
+        let server_max_file_size = config.server.max_file_size.as_u64();
+
         let mut locations: Vec<Location> = config
             .locations
             .iter()
-            .map(Location::from_config)
+            .map(|loc| Location::from_config(loc, server_max_file_size))
             .collect();
 
         // Sort by prefix length descending (longest match first).
@@ -203,7 +216,6 @@ impl FileSearcher {
         Self {
             locations,
             max_body_size: config.server.max_body_size.as_u64(),
-            max_file_size: config.server.max_file_size.as_u64(),
             stream_buffer_size: config.server.stream_buffer_size.as_usize(),
         }
     }
@@ -229,7 +241,7 @@ impl FileSearcher {
 
     async fn search(&self, request_path: &str) -> Option<(PathBuf, File, u64)> {
         let (location, stripped_path) = self.match_location(request_path)?;
-        location.search(stripped_path, self.max_file_size).await
+        location.search(stripped_path).await
     }
 }
 
