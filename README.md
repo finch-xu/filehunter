@@ -4,7 +4,9 @@
 
 <h1 align="center">FileHunter</h1>
 
+<p align="center">
 [![CodeQL](https://github.com/finch-xu/filehunter/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/finch-xu/filehunter/actions/workflows/github-code-scanning/codeql)
+</p>
 
 <p align="center">
   <a href="README.zh-CN.md">中文</a>
