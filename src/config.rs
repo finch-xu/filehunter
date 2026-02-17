@@ -39,11 +39,11 @@ impl fmt::Display for ByteSize {
         let b = self.0;
         if b == 0 {
             write!(f, "0")
-        } else if b % GB == 0 {
+        } else if b.is_multiple_of(GB) {
             write!(f, "{}GB", b / GB)
-        } else if b % MB == 0 {
+        } else if b.is_multiple_of(MB) {
             write!(f, "{}MB", b / MB)
-        } else if b % KB == 0 {
+        } else if b.is_multiple_of(KB) {
             write!(f, "{}KB", b / KB)
         } else {
             write!(f, "{}B", b)
@@ -122,6 +122,56 @@ pub struct Config {
     pub locations: Vec<LocationConfig>,
 }
 
+// ---------------------------------------------------------------------------
+// CORS & Rate Limit configuration
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CorsConfig {
+    pub enabled: bool,
+    pub allow_origins: Vec<String>,
+    pub allow_methods: Vec<String>,
+    pub allow_headers: Vec<String>,
+    pub expose_headers: Vec<String>,
+    pub max_age: u64,
+    pub allow_credentials: bool,
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_origins: vec!["*".into()],
+            allow_methods: vec!["GET".into(), "HEAD".into(), "OPTIONS".into()],
+            allow_headers: vec!["*".into()],
+            expose_headers: vec!["Content-Length".into(), "Content-Type".into()],
+            max_age: 86400,
+            allow_credentials: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RateLimitConfig {
+    pub enabled: bool,
+    pub requests_per_second: u32,
+    pub burst_size: u32,
+    pub cleanup_interval: u64,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            requests_per_second: 10,
+            burst_size: 30,
+            cleanup_interval: 600,
+        }
+    }
+}
+
 /// All fields except `bind` have sensible defaults — existing configs keep working.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -153,6 +203,12 @@ pub struct ServerConfig {
 
     /// Response streaming buffer size. e.g. "64KB"
     pub stream_buffer_size: ByteSize,
+
+    /// CORS configuration.
+    pub cors: CorsConfig,
+
+    /// Per-IP rate limiting configuration.
+    pub rate_limit: RateLimitConfig,
 }
 
 impl Default for ServerConfig {
@@ -167,6 +223,8 @@ impl Default for ServerConfig {
             http2_max_streams: 128,
             max_file_size: ByteSize(10 * 1024 * 1024),
             stream_buffer_size: ByteSize(65536),
+            cors: CorsConfig::default(),
+            rate_limit: RateLimitConfig::default(),
         }
     }
 }
@@ -267,6 +325,24 @@ impl Config {
         }
         if self.locations.is_empty() {
             return Err("at least one [[locations]] must be configured".into());
+        }
+
+        if self.server.cors.enabled
+            && self.server.cors.allow_credentials
+            && self.server.cors.allow_origins.iter().any(|o| o == "*")
+        {
+            return Err(
+                "CORS: allow_credentials=true is incompatible with allow_origins=[\"*\"]".into(),
+            );
+        }
+
+        if self.server.rate_limit.enabled {
+            if self.server.rate_limit.requests_per_second == 0 {
+                return Err("rate_limit.requests_per_second must be > 0".into());
+            }
+            if self.server.rate_limit.burst_size == 0 {
+                return Err("rate_limit.burst_size must be > 0".into());
+            }
         }
 
         let mut seen_prefixes = HashSet::new();

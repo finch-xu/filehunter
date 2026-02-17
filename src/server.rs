@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::ffi::OsStr;
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -15,9 +16,14 @@ use tokio::fs::File;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, info, warn};
 
-use crate::config::{normalize_prefix, Config, LocationConfig, SearchMode};
+use governor::clock::Clock;
 
-type ResponseBody = BoxBody<Bytes, std::io::Error>;
+use crate::config::{normalize_prefix, Config, LocationConfig, SearchMode};
+use crate::ratelimit::KeyedLimiter;
+
+pub type ResponseBody = BoxBody<Bytes, std::io::Error>;
+
+type SearchResult = (PathBuf, File, u64, SystemTime);
 
 struct SearchRoot {
     path: PathBuf,
@@ -167,12 +173,12 @@ impl Location {
             .and_then(OsStr::to_str)
             .unwrap_or("");
 
-        let mut best: Option<(PathBuf, File, u64, SystemTime)> = None;
+        let mut best: Option<SearchResult> = None;
 
         for root in &self.roots {
             match try_root(root, &relative, ext, self.max_file_size, request_path).await {
                 Ok(Some(found)) => {
-                    let dominated = best.as_ref().map_or(true, |b| found.3 > b.3);
+                    let dominated = best.as_ref().is_none_or(|b| found.3 > b.3);
                     if dominated {
                         if let Some(ref prev) = best {
                             debug!(
@@ -230,10 +236,10 @@ impl FileSearcher {
             if path == loc.prefix {
                 return Some((loc, "/"));
             }
-            if let Some(rest) = path.strip_prefix(&loc.prefix) {
-                if rest.starts_with('/') {
-                    return Some((loc, rest));
-                }
+            if let Some(rest) = path.strip_prefix(&loc.prefix)
+                && rest.starts_with('/')
+            {
+                return Some((loc, rest));
             }
         }
         None
@@ -260,7 +266,7 @@ async fn probe_candidate(
     candidate: PathBuf,
     max_file_size: u64,
     request_path: &str,
-) -> Result<Option<(PathBuf, File, u64, SystemTime)>, ()> {
+) -> Result<Option<SearchResult>, ()> {
     let canonical = match tokio::fs::canonicalize(&candidate).await {
         Ok(c) if c.starts_with(root_path) => c,
         Ok(_) => {
@@ -300,7 +306,7 @@ async fn try_root(
     ext: &str,
     max_file_size: u64,
     request_path: &str,
-) -> Result<Option<(PathBuf, File, u64, SystemTime)>, ()> {
+) -> Result<Option<SearchResult>, ()> {
     if !root.accepts(ext) {
         debug!(
             request_path, root = %root.path.display(), ext,
@@ -314,8 +320,8 @@ async fn try_root(
 /// Wait for the first `JoinHandle` that returns `Some`, then abort all
 /// remaining handles to free resources.
 async fn race_handles(
-    mut handles: Vec<tokio::task::JoinHandle<Option<(PathBuf, File, u64, SystemTime)>>>,
-) -> Option<(PathBuf, File, u64, SystemTime)> {
+    mut handles: Vec<tokio::task::JoinHandle<Option<SearchResult>>>,
+) -> Option<SearchResult> {
     let mut result = None;
 
     while !handles.is_empty() {
@@ -345,11 +351,10 @@ async fn probe_root(
     candidate: PathBuf,
     max_file_size: u64,
     request_path: String,
-) -> Option<(PathBuf, File, u64, SystemTime)> {
-    match probe_candidate(&root_path, candidate, max_file_size, &request_path).await {
-        Ok(found) => found,
-        Err(()) => None,
-    }
+) -> Option<SearchResult> {
+    probe_candidate(&root_path, candidate, max_file_size, &request_path)
+        .await
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -397,7 +402,28 @@ fn sanitize_path(raw: &str) -> Option<PathBuf> {
 pub async fn handle_request(
     req: Request<hyper::body::Incoming>,
     searcher: Arc<FileSearcher>,
+    limiter: Option<Arc<KeyedLimiter>>,
+    client_ip: IpAddr,
 ) -> Result<Response<ResponseBody>, Infallible> {
+    // Per-IP rate limiting (checked before anything else).
+    if let Some(ref lim) = limiter
+        && let Err(not_until) = lim.check_key(&client_ip)
+    {
+        let wait = not_until.wait_time_from(governor::clock::DefaultClock::default().now());
+        let retry_after = wait.as_secs().max(1);
+        debug!(
+            status = 429, %client_ip, retry_after,
+            "request handled (rate limited)"
+        );
+        return Ok(Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("Retry-After", retry_after)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .header("X-Content-Type-Options", "nosniff")
+            .body(full_body("Too Many Requests"))
+            .unwrap());
+    }
+
     if req.method() != Method::GET && req.method() != Method::HEAD {
         debug!(status = 405, method = %req.method(), "request handled");
         return Ok(text_response(
