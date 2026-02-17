@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a>
+  <a href="README.md">English</a> · <a href="https://github.com/finch-xu/filehunter/wiki">📖 Wiki</a>
 </p>
 
 <p align="center">
