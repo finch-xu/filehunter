@@ -43,6 +43,9 @@ bind = "0.0.0.0:8080"
 #   latest_modified — check all roots and return the file with the most recent
 #                     modification time.
 #
+# Each location can optionally override the server-level max_file_size.
+# If omitted, the location inherits the global [server].max_file_size.
+#
 # Each location has its own paths with optional extensions filter.
 # If extensions is omitted or empty, all file types are allowed.
 # Requests that don't match any location prefix return 404.
@@ -73,6 +76,7 @@ root = "/data/general"
 # [[locations]]
 # prefix = "/imgs"
 # mode = "sequential"
+# # No max_file_size → inherits server-level default (10MB)
 #
 # [[locations.paths]]
 # root = "/data/path1"
@@ -83,8 +87,18 @@ root = "/data/general"
 # extensions = ["jpg", "png", "webp"]
 #
 # [[locations]]
+# prefix = "/videos"
+# mode = "concurrent"
+# max_file_size = "500MB"       # Override: allow large video files
+#
+# [[locations.paths]]
+# root = "/data/videos"
+# extensions = ["mp4", "mkv", "webm"]
+#
+# [[locations]]
 # prefix = "/pdf"
 # mode = "concurrent"
+# max_file_size = "50MB"        # Override: PDFs up to 50MB
 #
 # [[locations.paths]]
 # root = "/data/pdf-store"

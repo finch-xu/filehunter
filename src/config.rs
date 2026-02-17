@@ -197,6 +197,10 @@ pub struct LocationConfig {
     #[serde(default)]
     pub mode: SearchMode,
 
+    /// Per-location maximum file size override.
+    /// If omitted, falls back to `[server].max_file_size`.
+    pub max_file_size: Option<ByteSize>,
+
     /// Search paths for this location.
     pub paths: Vec<SearchPath>,
 }
