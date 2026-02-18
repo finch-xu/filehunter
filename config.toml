@@ -33,6 +33,14 @@ bind = "0.0.0.0:8080"
 # Supports: "64KB", "128KB", or raw bytes like 65536
 # stream_buffer_size = "64KB"
 
+# Response compression (default: disabled).
+# When behind nginx/reverse proxy, leave disabled — let the proxy handle compression.
+# When deploying standalone on public networks, enable for text-heavy content.
+# [server.compression]
+# enabled = false
+# algorithms = ["gzip", "br"]     # options: gzip, deflate, br, zstd
+# min_size = "1KB"                 # skip responses smaller than this
+
 # ---------------------------------------------------------------------------
 # Locations — each [[locations]] maps a URL prefix to search paths.
 #

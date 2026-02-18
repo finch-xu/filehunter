@@ -10,8 +10,11 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
+use http_body_util::BodyExt as _;
 use tower::util::BoxCloneService;
 use tower::ServiceBuilder;
+use tower_http::compression::predicate::{DefaultPredicate, Predicate as _, SizeAbove};
+use tower_http::compression::{CompressionBody, CompressionLayer};
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer, ExposeHeaders};
 use tracing::{debug, info};
 
@@ -19,7 +22,7 @@ mod config;
 mod ratelimit;
 mod server;
 
-use config::{Config, CorsConfig};
+use config::{CompressionConfig, Config, CorsConfig};
 use ratelimit::KeyedLimiter;
 use server::{handle_request, FileSearcher, ResponseBody};
 
@@ -90,6 +93,47 @@ fn build_cors_layer(cfg: &CorsConfig) -> CorsLayer {
     layer
 }
 
+/// Predicate: respect `DefaultPredicate` (skip images, tiny responses) + user `min_size`.
+type CompPredicate =
+    tower_http::compression::predicate::And<DefaultPredicate, SizeAbove>;
+
+/// Build a `CompressionLayer` from config.
+///
+/// Algorithm selection (`no_*`) must happen before `compress_when()` because
+/// the disabler methods are only available on `CompressionLayer<DefaultPredicate>`.
+fn build_compression_layer(cfg: &CompressionConfig) -> CompressionLayer<CompPredicate> {
+    let mut layer = CompressionLayer::new();
+
+    let algos = &cfg.algorithms;
+    if !algos.iter().any(|a| a == "gzip") {
+        layer = layer.no_gzip();
+    }
+    if !algos.iter().any(|a| a == "br") {
+        layer = layer.no_br();
+    }
+    if !algos.iter().any(|a| a == "deflate") {
+        layer = layer.no_deflate();
+    }
+    if !algos.iter().any(|a| a == "zstd") {
+        layer = layer.no_zstd();
+    }
+
+    let min_size = cfg.min_size.as_u64().min(u16::MAX as u64) as u16;
+    let predicate = DefaultPredicate::new().and(SizeAbove::new(min_size));
+
+    layer.compress_when(predicate)
+}
+
+/// Re-box the compressed response body back into our erased `ResponseBody` type.
+///
+/// `CompressionBody` unifies errors into `BoxError`; we wrap it back into
+/// `std::io::Error` via `Error::other()` to match our `ResponseBody` alias.
+fn rebox_response(
+    resp: Response<CompressionBody<ResponseBody>>,
+) -> Response<ResponseBody> {
+    resp.map(|body| body.map_err(std::io::Error::other).boxed())
+}
+
 type ErasedService =
     BoxCloneService<Request<Incoming>, Response<ResponseBody>, Infallible>;
 
@@ -133,6 +177,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Compression layer (optional, default off).
+    let compression_layer = if config.server.compression.enabled {
+        Some(build_compression_layer(&config.server.compression))
+    } else {
+        None
+    };
+
     // Per-IP rate limiter (optional).
     let limiter: Option<Arc<KeyedLimiter>> = if config.server.rate_limit.enabled {
         let lim = ratelimit::build_limiter(&config.server.rate_limit);
@@ -158,6 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limit_enabled = config.server.rate_limit.enabled,
         rate_limit_rps = config.server.rate_limit.requests_per_second,
         rate_limit_burst = config.server.rate_limit.burst_size,
+        compression_enabled = config.server.compression.enabled,
         "server listening"
     );
 
@@ -168,6 +220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let searcher = searcher.clone();
                 let builder = builder.clone();
                 let cors_layer = cors_layer.clone();
+                let compression_layer = compression_layer.clone();
                 let limiter = limiter.clone();
                 let client_ip = remote_addr.ip();
 
@@ -182,14 +235,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     });
 
-                    let erased: ErasedService = if let Some(ref cors) = cors_layer {
-                        BoxCloneService::new(
+                    let erased: ErasedService = match (&cors_layer, &compression_layer) {
+                        (Some(cors), Some(comp)) => BoxCloneService::new(
+                            ServiceBuilder::new()
+                                .map_response(rebox_response)
+                                .layer(cors.clone())
+                                .layer(comp.clone())
+                                .service(inner),
+                        ),
+                        (None, Some(comp)) => BoxCloneService::new(
+                            ServiceBuilder::new()
+                                .map_response(rebox_response)
+                                .layer(comp.clone())
+                                .service(inner),
+                        ),
+                        (Some(cors), None) => BoxCloneService::new(
                             ServiceBuilder::new()
                                 .layer(cors.clone())
                                 .service(inner),
-                        )
-                    } else {
-                        BoxCloneService::new(inner)
+                        ),
+                        (None, None) => BoxCloneService::new(inner),
                     };
 
                     let hyper_svc = TowerToHyperService::new(erased);

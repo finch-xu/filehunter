@@ -172,6 +172,24 @@ impl Default for RateLimitConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CompressionConfig {
+    pub enabled: bool,
+    pub algorithms: Vec<String>,
+    pub min_size: ByteSize,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            algorithms: vec!["gzip".into(), "br".into()],
+            min_size: ByteSize(1024), // 1KB
+        }
+    }
+}
+
 /// All fields except `bind` have sensible defaults — existing configs keep working.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -209,6 +227,9 @@ pub struct ServerConfig {
 
     /// Per-IP rate limiting configuration.
     pub rate_limit: RateLimitConfig,
+
+    /// Response compression configuration.
+    pub compression: CompressionConfig,
 }
 
 impl Default for ServerConfig {
@@ -225,6 +246,7 @@ impl Default for ServerConfig {
             stream_buffer_size: ByteSize(65536),
             cors: CorsConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            compression: CompressionConfig::default(),
         }
     }
 }
@@ -342,6 +364,23 @@ impl Config {
             }
             if self.server.rate_limit.burst_size == 0 {
                 return Err("rate_limit.burst_size must be > 0".into());
+            }
+        }
+
+        if self.server.compression.enabled {
+            let valid = ["gzip", "deflate", "br", "zstd"];
+            for algo in &self.server.compression.algorithms {
+                if !valid.contains(&algo.as_str()) {
+                    return Err(format!(
+                        "unknown compression algorithm: {:?} (valid: gzip, deflate, br, zstd)",
+                        algo,
+                    ));
+                }
+            }
+            if self.server.compression.algorithms.is_empty() {
+                return Err(
+                    "compression.algorithms must not be empty when compression is enabled".into(),
+                );
             }
         }
 
