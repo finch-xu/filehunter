@@ -32,6 +32,7 @@ FileHunter routes requests by URL prefix to different groups of search directori
 - **Async streaming** — built on tokio + hyper 1.x with chunked `ReaderStream` for low memory usage
 - **HTTP/1.1 & HTTP/2** — automatic protocol negotiation via `hyper-util`
 - **Security hardened** — path traversal protection, TOCTOU mitigation, null byte rejection, dotfile blocking, prefix segment-boundary checks, `nosniff` headers
+- **Optional response compression** — gzip, deflate, Brotli, zstd (disabled by default, ideal for standalone public deployments)
 - **Human-friendly config** — TOML format with size values like `"10MB"`, `"64KB"`
 - **Tiny footprint** — ~3 MB binary (LTO + strip)
 
@@ -78,6 +79,10 @@ max_body_size = "10MB"
 # http2_max_streams = 128
 max_file_size = "10MB"          # 0 = no limit
 # stream_buffer_size = "64KB"
+# [server.compression]
+# enabled = false               # enable gzip/deflate/br/zstd
+# algorithms = ["gzip", "br"]
+# min_size = "1KB"
 
 [[locations]]
 prefix = "/imgs"
