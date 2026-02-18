@@ -12,4 +12,9 @@ services:
       - /data/documents:/data/documents:ro
       - /data/videos:/data/videos:ro
       - /data/general:/data/general:ro
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     restart: unless-stopped
