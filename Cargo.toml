@@ -1,6 +1,6 @@
 [package]
 name = "filehunter"
-version = "0.6.0"
+version = "0.6.6"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
