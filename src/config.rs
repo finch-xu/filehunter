@@ -334,7 +334,7 @@ impl Config {
         Ok(config)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.server.max_header_size.0 < MIN_HEADER_SIZE {
             return Err(format!(
                 "max_header_size must be >= {} (got {})",
@@ -407,5 +407,226 @@ impl Config {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper: wraps a ByteSize so we can round-trip through toml.
+    #[derive(Debug, Deserialize)]
+    struct SizeWrapper {
+        size: ByteSize,
+    }
+
+    // -----------------------------------------------------------------------
+    // ByteSize deserialization (7 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bytesize_from_integer() {
+        let w: SizeWrapper = toml::from_str("size = 65536").unwrap();
+        assert_eq!(w.size.0, 65536);
+    }
+
+    #[test]
+    fn bytesize_from_kb() {
+        let w: SizeWrapper = toml::from_str(r#"size = "64KB""#).unwrap();
+        assert_eq!(w.size.0, 65536);
+    }
+
+    #[test]
+    fn bytesize_from_mb() {
+        let w: SizeWrapper = toml::from_str(r#"size = "1MB""#).unwrap();
+        assert_eq!(w.size.0, 1_048_576);
+    }
+
+    #[test]
+    fn bytesize_from_gb() {
+        let w: SizeWrapper = toml::from_str(r#"size = "2GB""#).unwrap();
+        assert_eq!(w.size.0, 2_147_483_648);
+    }
+
+    #[test]
+    fn bytesize_case_insensitive() {
+        let w: SizeWrapper = toml::from_str(r#"size = "1kb""#).unwrap();
+        assert_eq!(w.size.0, 1024);
+    }
+
+    #[test]
+    fn bytesize_rejects_negative() {
+        let err = toml::from_str::<SizeWrapper>("size = -1").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("negative"), "expected 'negative' in: {msg}");
+    }
+
+    #[test]
+    fn bytesize_rejects_unknown_unit() {
+        let err = toml::from_str::<SizeWrapper>(r#"size = "10TB""#).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown unit"), "expected 'unknown unit' in: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // ByteSize Display (4 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn display_zero() {
+        assert_eq!(ByteSize(0).to_string(), "0");
+    }
+
+    #[test]
+    fn display_kb() {
+        assert_eq!(ByteSize(65536).to_string(), "64KB");
+    }
+
+    #[test]
+    fn display_mb() {
+        assert_eq!(ByteSize(1_048_576).to_string(), "1MB");
+    }
+
+    #[test]
+    fn display_non_aligned() {
+        assert_eq!(ByteSize(1025).to_string(), "1025B");
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_prefix (4 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prefix_adds_leading_slash() {
+        assert_eq!(normalize_prefix("imgs"), "/imgs");
+    }
+
+    #[test]
+    fn prefix_strips_trailing_slash() {
+        assert_eq!(normalize_prefix("/imgs/"), "/imgs");
+    }
+
+    #[test]
+    fn prefix_root_preserved() {
+        assert_eq!(normalize_prefix("/"), "/");
+    }
+
+    #[test]
+    fn prefix_multi_segment() {
+        assert_eq!(normalize_prefix("/data/images"), "/data/images");
+    }
+
+    // -----------------------------------------------------------------------
+    // SearchPath::extension_set (3 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extension_set_empty_returns_none() {
+        let sp = SearchPath {
+            root: PathBuf::from("/tmp"),
+            extensions: vec![],
+        };
+        assert!(sp.extension_set().is_none());
+    }
+
+    #[test]
+    fn extension_set_strips_dots_lowercases() {
+        let sp = SearchPath {
+            root: PathBuf::from("/tmp"),
+            extensions: vec![".JPG".into(), "Png".into()],
+        };
+        let set = sp.extension_set().unwrap();
+        assert!(set.contains("jpg"));
+        assert!(set.contains("png"));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn extension_set_deduplicates() {
+        let sp = SearchPath {
+            root: PathBuf::from("/tmp"),
+            extensions: vec!["jpg".into(), "JPG".into()],
+        };
+        let set = sp.extension_set().unwrap();
+        assert_eq!(set.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Config::validate (6 tests)
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal valid Config for mutation-based tests.
+    fn valid_config() -> Config {
+        Config {
+            server: ServerConfig::default(),
+            locations: vec![LocationConfig {
+                prefix: "/".into(),
+                mode: SearchMode::Sequential,
+                max_file_size: None,
+                paths: vec![SearchPath {
+                    root: PathBuf::from("/tmp"),
+                    extensions: vec![],
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn validate_rejects_small_header_size() {
+        let mut cfg = valid_config();
+        cfg.server.max_header_size = ByteSize(4096);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("must be >= 8KB"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_stream_buffer() {
+        let mut cfg = valid_config();
+        cfg.server.stream_buffer_size = ByteSize(0);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("must be > 0"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_no_locations() {
+        let mut cfg = valid_config();
+        cfg.locations = vec![];
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("at least one"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_cors_cred_wildcard() {
+        let mut cfg = valid_config();
+        cfg.server.cors.enabled = true;
+        cfg.server.cors.allow_credentials = true;
+        cfg.server.cors.allow_origins = vec!["*".into()];
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("incompatible"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_ratelimit_zero_rps() {
+        let mut cfg = valid_config();
+        cfg.server.rate_limit.enabled = true;
+        cfg.server.rate_limit.requests_per_second = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("requests_per_second"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_prefix() {
+        let mut cfg = valid_config();
+        cfg.locations.push(LocationConfig {
+            prefix: "/".into(),
+            mode: SearchMode::Sequential,
+            max_file_size: None,
+            paths: vec![SearchPath {
+                root: PathBuf::from("/tmp"),
+                extensions: vec![],
+            }],
+        });
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("duplicate"), "error: {err}");
     }
 }

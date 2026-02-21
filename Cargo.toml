@@ -25,6 +25,9 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "compression-gzip", "compression-br", "compression-deflate", "compression-zstd"] }
 governor = "0.10"
 
+[dev-dependencies]
+tempfile = "3"
+
 [profile.release]
 opt-level = 3
 lto = true

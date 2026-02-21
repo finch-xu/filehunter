@@ -400,7 +400,7 @@ fn sanitize_path(raw: &str) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 pub async fn handle_request(
-    req: Request<hyper::body::Incoming>,
+    req: Request<impl hyper::body::Body + Send + 'static>,
     searcher: Arc<FileSearcher>,
     limiter: Option<Arc<KeyedLimiter>>,
     client_ip: IpAddr,
@@ -510,4 +510,168 @@ fn text_response(status: StatusCode, message: &'static str) -> Response<Response
         .header("X-Content-Type-Options", "nosniff")
         .body(full_body(message))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{normalize_prefix, SearchMode};
+
+    // -----------------------------------------------------------------------
+    // sanitize_path — security-critical (10 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_normal_path() {
+        let p = sanitize_path("/foo/bar.txt").unwrap();
+        assert_eq!(p, PathBuf::from("foo/bar.txt"));
+    }
+
+    #[test]
+    fn sanitize_nested_path() {
+        let p = sanitize_path("/a/b/c/d.png").unwrap();
+        assert_eq!(p, PathBuf::from("a/b/c/d.png"));
+    }
+
+    #[test]
+    fn sanitize_single_file() {
+        let p = sanitize_path("/readme.md").unwrap();
+        assert_eq!(p, PathBuf::from("readme.md"));
+    }
+
+    #[test]
+    fn sanitize_rejects_null_byte() {
+        assert!(sanitize_path("/foo\0bar").is_none());
+    }
+
+    #[test]
+    fn sanitize_rejects_dotdot() {
+        assert!(sanitize_path("/foo/../etc/passwd").is_none());
+    }
+
+    #[test]
+    fn sanitize_rejects_dotfile() {
+        assert!(sanitize_path("/.env").is_none());
+    }
+
+    #[test]
+    fn sanitize_rejects_hidden_dir() {
+        assert!(sanitize_path("/.git/config").is_none());
+    }
+
+    #[test]
+    fn sanitize_rejects_empty() {
+        assert!(sanitize_path("/").is_none());
+    }
+
+    #[test]
+    fn sanitize_url_encoded_space() {
+        let p = sanitize_path("/foo%20bar.txt").unwrap();
+        assert_eq!(p, PathBuf::from("foo bar.txt"));
+    }
+
+    #[test]
+    fn sanitize_url_encoded_dotdot() {
+        assert!(sanitize_path("/%2e%2e/etc/passwd").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // SearchRoot::accepts (3 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn accepts_all_when_none() {
+        let root = SearchRoot {
+            path: PathBuf::from("/tmp"),
+            extensions: None,
+        };
+        assert!(root.accepts("gif"));
+    }
+
+    #[test]
+    fn accepts_matching_case_insensitive() {
+        let set = HashSet::from(["jpg".to_string(), "png".to_string()]);
+        let root = SearchRoot {
+            path: PathBuf::from("/tmp"),
+            extensions: Some(set),
+        };
+        assert!(root.accepts("JPG"));
+    }
+
+    #[test]
+    fn rejects_non_matching() {
+        let set = HashSet::from(["jpg".to_string()]);
+        let root = SearchRoot {
+            path: PathBuf::from("/tmp"),
+            extensions: Some(set),
+        };
+        assert!(!root.accepts("gif"));
+    }
+
+    // -----------------------------------------------------------------------
+    // FileSearcher::match_location (6 tests)
+    // -----------------------------------------------------------------------
+
+    /// Build a FileSearcher with prefix-only locations (no real filesystem roots).
+    fn searcher_with_prefixes(prefixes: &[&str]) -> FileSearcher {
+        let mut locations: Vec<Location> = prefixes
+            .iter()
+            .map(|p| Location {
+                prefix: normalize_prefix(p),
+                roots: vec![],
+                search_mode: SearchMode::Sequential,
+                max_file_size: 0,
+            })
+            .collect();
+        locations.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        FileSearcher {
+            locations,
+            max_body_size: 1_048_576,
+            stream_buffer_size: 65536,
+        }
+    }
+
+    #[test]
+    fn match_exact() {
+        let s = searcher_with_prefixes(&["/imgs"]);
+        let (loc, rest) = s.match_location("/imgs").unwrap();
+        assert_eq!(loc.prefix, "/imgs");
+        assert_eq!(rest, "/");
+    }
+
+    #[test]
+    fn match_prefix_with_rest() {
+        let s = searcher_with_prefixes(&["/imgs"]);
+        let (loc, rest) = s.match_location("/imgs/a.jpg").unwrap();
+        assert_eq!(loc.prefix, "/imgs");
+        assert_eq!(rest, "/a.jpg");
+    }
+
+    #[test]
+    fn match_root_catchall() {
+        let s = searcher_with_prefixes(&["/imgs", "/"]);
+        let (loc, rest) = s.match_location("/other/x").unwrap();
+        assert_eq!(loc.prefix, "/");
+        assert_eq!(rest, "/other/x");
+    }
+
+    #[test]
+    fn match_longest_prefix_wins() {
+        let s = searcher_with_prefixes(&["/img", "/img/photos"]);
+        let (loc, rest) = s.match_location("/img/photos/a.jpg").unwrap();
+        assert_eq!(loc.prefix, "/img/photos");
+        assert_eq!(rest, "/a.jpg");
+    }
+
+    #[test]
+    fn match_no_false_partial() {
+        let s = searcher_with_prefixes(&["/img"]);
+        assert!(s.match_location("/image/x.jpg").is_none());
+    }
+
+    #[test]
+    fn match_no_match() {
+        let s = searcher_with_prefixes(&["/imgs"]);
+        assert!(s.match_location("/videos/x").is_none());
+    }
 }

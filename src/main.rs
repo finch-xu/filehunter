@@ -18,13 +18,9 @@ use tower_http::compression::{CompressionBody, CompressionLayer};
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer, ExposeHeaders};
 use tracing::{debug, info};
 
-mod config;
-mod ratelimit;
-mod server;
-
-use config::{CompressionConfig, Config, CorsConfig};
-use ratelimit::KeyedLimiter;
-use server::{handle_request, FileSearcher, ResponseBody};
+use filehunter::config::{CompressionConfig, Config, CorsConfig};
+use filehunter::ratelimit::{self, KeyedLimiter};
+use filehunter::server::{handle_request, FileSearcher, ResponseBody};
 
 #[derive(Parser)]
 #[command(
