@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <a href="https://github.com/finch-xu/filehunter/wiki">📖 Wiki</a>
+  <a href="README.md">English</a> · <a href="https://github.com/finch-xu/filehunter/wiki"><img src="https://img.shields.io/badge/wiki-documentation-blue?logo=github" alt="Wiki"></a> · <a href="https://deepwiki.com/finch-xu/filehunter"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
 </p>
 
 <p align="center">
