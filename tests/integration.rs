@@ -23,6 +23,18 @@ fn make_request(method: &str, uri: &str) -> Request<Empty<Bytes>> {
         .unwrap()
 }
 
+fn make_request_with_headers(
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> Request<Empty<Bytes>> {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    builder.body(Empty::new()).unwrap()
+}
+
 fn localhost() -> IpAddr {
     "127.0.0.1".parse().unwrap()
 }
@@ -335,4 +347,211 @@ async fn rate_limited_returns_429() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(resp.headers().contains_key("Retry-After"));
+}
+
+// ---------------------------------------------------------------------------
+// Health check (4 tests)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn health_get_returns_200_ok() {
+    let (_dir, searcher) = setup_single_root(&[("test.txt", b"hello")], vec![]);
+    let req = make_request("GET", "/health");
+    let resp = handle_request(req, searcher, None, localhost()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert_eq!(body, "OK");
+}
+
+#[tokio::test]
+async fn health_head_returns_200_empty() {
+    let (_dir, searcher) = setup_single_root(&[("test.txt", b"hello")], vec![]);
+    let req = make_request("HEAD", "/health");
+    let resp = handle_request(req, searcher, None, localhost()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("Content-Length").unwrap().to_str().unwrap(),
+        "2"
+    );
+    let body = body_string(resp).await;
+    assert!(body.is_empty());
+}
+
+#[tokio::test]
+async fn ready_get_returns_200() {
+    let (_dir, searcher) = setup_single_root(&[("test.txt", b"hello")], vec![]);
+    let req = make_request("GET", "/ready");
+    let resp = handle_request(req, searcher, None, localhost()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert_eq!(body, "READY");
+}
+
+#[tokio::test]
+async fn health_post_returns_405() {
+    let (_dir, searcher) = setup_single_root(&[("test.txt", b"hello")], vec![]);
+    let req = make_request("POST", "/health");
+    let resp = handle_request(req, searcher, None, localhost()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+// ---------------------------------------------------------------------------
+// ETag / Last-Modified / 304 (4 tests)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn response_includes_etag_and_last_modified() {
+    let (_dir, searcher) = setup_single_root(&[("test.txt", b"hello")], vec![]);
+    let req = make_request("GET", "/test.txt");
+    let resp = handle_request(req, searcher, None, localhost()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().contains_key("ETag"));
+    assert!(resp.headers().contains_key("Last-Modified"));
+    assert_eq!(
+        resp.headers().get("Accept-Ranges").unwrap().to_str().unwrap(),
+        "bytes"
+    );
+}
+
+#[tokio::test]
+async fn if_none_match_returns_304() {
+    let (_dir, searcher) = setup_single_root(&[("test.txt", b"hello")], vec![]);
+
+    // First request to get the ETag
+    let req = make_request("GET", "/test.txt");
+    let resp = handle_request(req, searcher.clone(), None, localhost()).await.unwrap();
+    let etag = resp
+        .headers()
+        .get("ETag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Second request with If-None-Match
+    let req = make_request_with_headers("GET", "/test.txt", &[("If-None-Match", &etag)]);
+    let resp = handle_request(req, searcher, None, localhost()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+}
+
+#[tokio::test]
+async fn if_none_match_wrong_etag_returns_200() {
+    let (_dir, searcher) = setup_single_root(&[("test.txt", b"hello")], vec![]);
+    let req =
+        make_request_with_headers("GET", "/test.txt", &[("If-None-Match", "W/\"wrong\"")]);
+    let resp = handle_request(req, searcher, None, localhost()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn if_modified_since_returns_304() {
+    let (_dir, searcher) = setup_single_root(&[("test.txt", b"hello")], vec![]);
+
+    // First request to get the Last-Modified
+    let req = make_request("GET", "/test.txt");
+    let resp = handle_request(req, searcher.clone(), None, localhost()).await.unwrap();
+    let last_modified = resp
+        .headers()
+        .get("Last-Modified")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Second request with If-Modified-Since (same time → not modified)
+    let req = make_request_with_headers(
+        "GET",
+        "/test.txt",
+        &[("If-Modified-Since", &last_modified)],
+    );
+    let resp = handle_request(req, searcher, None, localhost()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+}
+
+// ---------------------------------------------------------------------------
+// Range requests (5 tests)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn range_from_to_returns_206() {
+    let (_dir, searcher) =
+        setup_single_root(&[("data.txt", b"Hello, World!")], vec![]);
+    let req = make_request_with_headers("GET", "/data.txt", &[("Range", "bytes=0-4")]);
+    let resp = handle_request(req, searcher, None, localhost()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        resp.headers()
+            .get("Content-Range")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "bytes 0-4/13"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("Content-Length")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "5"
+    );
+    let body = body_string(resp).await;
+    assert_eq!(body, "Hello");
+}
+
+#[tokio::test]
+async fn range_from_open_returns_206() {
+    let (_dir, searcher) =
+        setup_single_root(&[("data.txt", b"Hello, World!")], vec![]);
+    let req = make_request_with_headers("GET", "/data.txt", &[("Range", "bytes=7-")]);
+    let resp = handle_request(req, searcher, None, localhost()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    let body = body_string(resp).await;
+    assert_eq!(body, "World!");
+}
+
+#[tokio::test]
+async fn range_suffix_returns_206() {
+    let (_dir, searcher) =
+        setup_single_root(&[("data.txt", b"Hello, World!")], vec![]);
+    let req = make_request_with_headers("GET", "/data.txt", &[("Range", "bytes=-6")]);
+    let resp = handle_request(req, searcher, None, localhost()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    let body = body_string(resp).await;
+    assert_eq!(body, "World!");
+}
+
+#[tokio::test]
+async fn range_beyond_eof_returns_416() {
+    let (_dir, searcher) =
+        setup_single_root(&[("data.txt", b"Hello")], vec![]);
+    let req = make_request_with_headers("GET", "/data.txt", &[("Range", "bytes=100-200")]);
+    let resp = handle_request(req, searcher, None, localhost()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert!(resp
+        .headers()
+        .get("Content-Range")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("bytes */"));
+}
+
+#[tokio::test]
+async fn head_with_range_returns_206_empty_body() {
+    let (_dir, searcher) =
+        setup_single_root(&[("data.txt", b"Hello, World!")], vec![]);
+    let req = make_request_with_headers("HEAD", "/data.txt", &[("Range", "bytes=0-4")]);
+    let resp = handle_request(req, searcher, None, localhost()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        resp.headers()
+            .get("Content-Length")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "5"
+    );
+    let body = body_string(resp).await;
+    assert!(body.is_empty());
 }

@@ -104,7 +104,7 @@ impl Location {
     }
 
     /// Search across this location's roots using its configured search mode.
-    async fn search(&self, request_path: &str) -> Option<(PathBuf, File, u64)> {
+    async fn search(&self, request_path: &str) -> Option<SearchResult> {
         match self.search_mode {
             SearchMode::Sequential => self.search_sequential(request_path).await,
             SearchMode::Concurrent => self.search_concurrent(request_path).await,
@@ -112,7 +112,7 @@ impl Location {
         }
     }
 
-    async fn search_sequential(&self, request_path: &str) -> Option<(PathBuf, File, u64)> {
+    async fn search_sequential(&self, request_path: &str) -> Option<SearchResult> {
         let relative = sanitize_path(request_path)?;
 
         let ext = relative
@@ -122,7 +122,7 @@ impl Location {
 
         for root in &self.roots {
             match try_root(root, &relative, ext, self.max_file_size, request_path).await {
-                Ok(Some((path, file, size, _mtime))) => return Some((path, file, size)),
+                Ok(Some(result)) => return Some(result),
                 Ok(None) => continue,
                 Err(()) => return None,
             }
@@ -131,7 +131,7 @@ impl Location {
         None
     }
 
-    async fn search_concurrent(&self, request_path: &str) -> Option<(PathBuf, File, u64)> {
+    async fn search_concurrent(&self, request_path: &str) -> Option<SearchResult> {
         let relative = sanitize_path(request_path)?;
 
         let ext = relative
@@ -161,11 +161,10 @@ impl Location {
             ));
         }
 
-        let result = race_handles(handles).await;
-        result.map(|(path, file, size, _mtime)| (path, file, size))
+        race_handles(handles).await
     }
 
-    async fn search_latest(&self, request_path: &str) -> Option<(PathBuf, File, u64)> {
+    async fn search_latest(&self, request_path: &str) -> Option<SearchResult> {
         let relative = sanitize_path(request_path)?;
 
         let ext = relative
@@ -196,7 +195,7 @@ impl Location {
             }
         }
 
-        best.map(|(path, file, size, _mtime)| (path, file, size))
+        best
     }
 }
 
@@ -245,7 +244,7 @@ impl FileSearcher {
         None
     }
 
-    async fn search(&self, request_path: &str) -> Option<(PathBuf, File, u64)> {
+    async fn search(&self, request_path: &str) -> Option<SearchResult> {
         let (location, stripped_path) = self.match_location(request_path)?;
         location.search(stripped_path).await
     }
@@ -405,7 +404,31 @@ pub async fn handle_request(
     limiter: Option<Arc<KeyedLimiter>>,
     client_ip: IpAddr,
 ) -> Result<Response<ResponseBody>, Infallible> {
-    // Per-IP rate limiting (checked before anything else).
+    let path = req.uri().path();
+
+    // Health check endpoints — exempt from rate limiting, priority over file routing.
+    if path == "/health" || path == "/ready" {
+        if req.method() != Method::GET && req.method() != Method::HEAD {
+            return Ok(text_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "Method Not Allowed",
+            ));
+        }
+        let msg = if path == "/health" { "OK" } else { "READY" };
+        let body = if req.method() == Method::HEAD {
+            empty_body()
+        } else {
+            full_body(msg)
+        };
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .header("Content-Length", msg.len())
+            .body(body)
+            .unwrap());
+    }
+
+    // Per-IP rate limiting (checked before anything else except health).
     if let Some(ref lim) = limiter
         && let Err(not_until) = lim.check_key(&client_ip)
     {
@@ -440,7 +463,7 @@ pub async fn handle_request(
             .and_then(|s| s.parse().ok())
             .unwrap_or(u64::MAX); // treat unparseable as oversized → 413
         if len > searcher.max_body_size {
-            debug!(status = 413, path = %req.uri().path(), "request handled");
+            debug!(status = 413, path, "request handled");
             return Ok(text_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Payload Too Large",
@@ -448,17 +471,108 @@ pub async fn handle_request(
         }
     }
 
-    let path = req.uri().path();
     let is_head = req.method() == Method::HEAD;
 
     match searcher.search(path).await {
-        Some((file_path, file, size)) => {
+        Some((file_path, file, size, mtime)) => {
+            let mime = mime_guess::from_path(&file_path).first_or_octet_stream();
+            let etag = generate_etag(mtime, size);
+            let last_modified = format_http_date(mtime);
+
+            // 304 Not Modified check
+            if is_not_modified(req.headers(), &etag, mtime) {
+                debug!(status = 304, path, "request handled (not modified)");
+                return Ok(Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header("ETag", &etag)
+                    .header("Last-Modified", &last_modified)
+                    .body(empty_body())
+                    .unwrap());
+            }
+
+            // Range request check
+            if let Some(range_val) = req.headers().get(hyper::header::RANGE) {
+                if let Ok(range_str) = range_val.to_str() {
+                    if should_honor_range(req.headers(), &etag, mtime) {
+                        if let Some(byte_range) = parse_range_header(range_str) {
+                            match byte_range.resolve(size) {
+                                Some((start, end)) => {
+                                    let content_length = end - start + 1;
+                                    let content_range =
+                                        format!("bytes {start}-{end}/{size}");
+
+                                    debug!(
+                                        status = 206, path,
+                                        resolved = %file_path.display(),
+                                        range = %content_range,
+                                        "request handled (partial content)"
+                                    );
+
+                                    let body = if is_head {
+                                        empty_body()
+                                    } else {
+                                        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+                                        let mut file = file;
+                                        if file
+                                            .seek(std::io::SeekFrom::Start(start))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return Ok(text_response(
+                                                StatusCode::INTERNAL_SERVER_ERROR,
+                                                "Internal Server Error",
+                                            ));
+                                        }
+                                        let limited = file.take(content_length);
+                                        let stream = ReaderStream::with_capacity(
+                                            limited,
+                                            searcher.stream_buffer_size,
+                                        );
+                                        StreamBody::new(stream.map_ok(Frame::data))
+                                            .boxed()
+                                    };
+
+                                    return Ok(Response::builder()
+                                        .status(StatusCode::PARTIAL_CONTENT)
+                                        .header("Content-Type", mime.as_ref())
+                                        .header("Content-Length", content_length)
+                                        .header("Content-Range", content_range)
+                                        .header("Accept-Ranges", "bytes")
+                                        .header("ETag", &etag)
+                                        .header("Last-Modified", &last_modified)
+                                        .header("X-Content-Type-Options", "nosniff")
+                                        .body(body)
+                                        .unwrap());
+                                }
+                                None => {
+                                    debug!(
+                                        status = 416, path,
+                                        "request handled (range not satisfiable)"
+                                    );
+                                    return Ok(Response::builder()
+                                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                                        .header(
+                                            "Content-Range",
+                                            format!("bytes */{size}"),
+                                        )
+                                        .header("Content-Type", "text/plain; charset=utf-8")
+                                        .header("X-Content-Type-Options", "nosniff")
+                                        .body(full_body("Range Not Satisfiable"))
+                                        .unwrap());
+                                }
+                            }
+                        }
+                    }
+                    // If should_honor_range is false or parse failed, fall through to full 200
+                }
+            }
+
+            // Full 200 response
             debug!(
                 status = 200, path,
                 resolved = %file_path.display(), size,
                 "request handled"
             );
-            let mime = mime_guess::from_path(&file_path).first_or_octet_stream();
 
             let body = if is_head {
                 empty_body()
@@ -470,7 +584,9 @@ pub async fn handle_request(
                 .status(StatusCode::OK)
                 .header("Content-Type", mime.as_ref())
                 .header("Content-Length", size)
-                .header("Accept-Ranges", "none")
+                .header("Accept-Ranges", "bytes")
+                .header("ETag", &etag)
+                .header("Last-Modified", &last_modified)
                 .header("X-Content-Type-Options", "nosniff")
                 .body(body)
                 .unwrap())
@@ -480,6 +596,139 @@ pub async fn handle_request(
             Ok(text_response(StatusCode::NOT_FOUND, "Not Found"))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Conditional request helpers (ETag / Last-Modified / 304)
+// ---------------------------------------------------------------------------
+
+fn format_http_date(time: SystemTime) -> String {
+    httpdate::fmt_http_date(time)
+}
+
+fn generate_etag(mtime: SystemTime, size: u64) -> String {
+    let secs = mtime
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("W/\"{secs}-{size}\"")
+}
+
+fn is_not_modified(headers: &hyper::HeaderMap, etag: &str, mtime: SystemTime) -> bool {
+    // If-None-Match takes priority over If-Modified-Since (RFC 9110 §13.1.2)
+    if let Some(inm) = headers.get(hyper::header::IF_NONE_MATCH) {
+        if let Ok(val) = inm.to_str() {
+            if val.trim() == "*" {
+                return true;
+            }
+            return val.split(',').any(|tag| tag.trim() == etag);
+        }
+    }
+
+    if let Some(ims) = headers.get(hyper::header::IF_MODIFIED_SINCE) {
+        if let Ok(val) = ims.to_str() {
+            if let Ok(since) = httpdate::parse_http_date(val) {
+                let mtime_secs = mtime
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let since_secs = since
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                return mtime_secs <= since_secs;
+            }
+        }
+    }
+
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Range request helpers (206 Partial Content)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ByteRange {
+    FromTo(u64, u64),
+    From(u64),
+    Suffix(u64),
+}
+
+impl ByteRange {
+    fn resolve(self, file_size: u64) -> Option<(u64, u64)> {
+        if file_size == 0 {
+            return None;
+        }
+        match self {
+            ByteRange::FromTo(start, end) => {
+                if start >= file_size || start > end {
+                    return None;
+                }
+                Some((start, end.min(file_size - 1)))
+            }
+            ByteRange::From(start) => {
+                if start >= file_size {
+                    return None;
+                }
+                Some((start, file_size - 1))
+            }
+            ByteRange::Suffix(n) => {
+                if n == 0 {
+                    return None;
+                }
+                let start = file_size.saturating_sub(n);
+                Some((start, file_size - 1))
+            }
+        }
+    }
+}
+
+fn parse_range_header(value: &str) -> Option<ByteRange> {
+    let value = value.strip_prefix("bytes=")?;
+    // Multi-range not supported — fall back to full response
+    if value.contains(',') {
+        return None;
+    }
+    let value = value.trim();
+    if let Some(suffix) = value.strip_prefix('-') {
+        let n: u64 = suffix.trim().parse().ok()?;
+        return Some(ByteRange::Suffix(n));
+    }
+    let (start_str, end_str) = value.split_once('-')?;
+    let start: u64 = start_str.trim().parse().ok()?;
+    if end_str.trim().is_empty() {
+        return Some(ByteRange::From(start));
+    }
+    let end: u64 = end_str.trim().parse().ok()?;
+    Some(ByteRange::FromTo(start, end))
+}
+
+fn should_honor_range(headers: &hyper::HeaderMap, etag: &str, mtime: SystemTime) -> bool {
+    let Some(if_range) = headers.get(hyper::header::IF_RANGE) else {
+        return true; // No If-Range → always honor range
+    };
+    let Ok(val) = if_range.to_str() else {
+        return false;
+    };
+    let val = val.trim();
+    // ETag comparison
+    if val.starts_with('"') || val.starts_with("W/\"") {
+        return val == etag;
+    }
+    // HTTP-date comparison
+    if let Ok(date) = httpdate::parse_http_date(val) {
+        let mtime_secs = mtime
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let date_secs = date
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        return mtime_secs == date_secs;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -673,5 +922,171 @@ mod tests {
     fn match_no_match() {
         let s = searcher_with_prefixes(&["/imgs"]);
         assert!(s.match_location("/videos/x").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // generate_etag (2 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn etag_format() {
+        let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let etag = generate_etag(mtime, 524288);
+        assert_eq!(etag, "W/\"1700000000-524288\"");
+    }
+
+    #[test]
+    fn etag_deterministic() {
+        let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        assert_eq!(generate_etag(mtime, 42), generate_etag(mtime, 42));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_not_modified (3 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn not_modified_if_none_match() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::IF_NONE_MATCH,
+            "W/\"100-42\"".parse().unwrap(),
+        );
+        let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        assert!(is_not_modified(&headers, "W/\"100-42\"", mtime));
+    }
+
+    #[test]
+    fn not_modified_if_modified_since() {
+        let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::IF_MODIFIED_SINCE,
+            format_http_date(mtime).parse().unwrap(),
+        );
+        assert!(is_not_modified(&headers, "W/\"wrong\"", mtime));
+    }
+
+    #[test]
+    fn not_modified_if_none_match_priority() {
+        // If-None-Match doesn't match → not 304, even if If-Modified-Since matches
+        let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::IF_NONE_MATCH,
+            "W/\"wrong\"".parse().unwrap(),
+        );
+        headers.insert(
+            hyper::header::IF_MODIFIED_SINCE,
+            format_http_date(mtime).parse().unwrap(),
+        );
+        assert!(!is_not_modified(&headers, "W/\"100-42\"", mtime));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_range_header (7 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn range_from_to() {
+        assert_eq!(
+            parse_range_header("bytes=0-99"),
+            Some(ByteRange::FromTo(0, 99))
+        );
+    }
+
+    #[test]
+    fn range_from_open() {
+        assert_eq!(
+            parse_range_header("bytes=100-"),
+            Some(ByteRange::From(100))
+        );
+    }
+
+    #[test]
+    fn range_suffix() {
+        assert_eq!(
+            parse_range_header("bytes=-100"),
+            Some(ByteRange::Suffix(100))
+        );
+    }
+
+    #[test]
+    fn range_multi_unsupported() {
+        assert_eq!(parse_range_header("bytes=0-10,20-30"), None);
+    }
+
+    #[test]
+    fn range_no_prefix() {
+        assert_eq!(parse_range_header("items=0-10"), None);
+    }
+
+    #[test]
+    fn range_garbage() {
+        assert_eq!(parse_range_header("bytes=abc"), None);
+    }
+
+    #[test]
+    fn range_empty_suffix() {
+        // "bytes=-" is invalid — no number after -
+        assert_eq!(parse_range_header("bytes=-"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // ByteRange::resolve (5 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_from_to_normal() {
+        assert_eq!(ByteRange::FromTo(0, 99).resolve(200), Some((0, 99)));
+    }
+
+    #[test]
+    fn resolve_from_to_clamped() {
+        // end exceeds file size → clamp to file_size - 1
+        assert_eq!(ByteRange::FromTo(0, 999).resolve(100), Some((0, 99)));
+    }
+
+    #[test]
+    fn resolve_from_beyond_eof() {
+        assert_eq!(ByteRange::From(100).resolve(50), None);
+    }
+
+    #[test]
+    fn resolve_suffix_zero() {
+        assert_eq!(ByteRange::Suffix(0).resolve(100), None);
+    }
+
+    #[test]
+    fn resolve_empty_file() {
+        assert_eq!(ByteRange::From(0).resolve(0), None);
+        assert_eq!(ByteRange::Suffix(10).resolve(0), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // should_honor_range (3 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn honor_range_no_if_range() {
+        let headers = hyper::HeaderMap::new();
+        let mtime = SystemTime::UNIX_EPOCH;
+        assert!(should_honor_range(&headers, "W/\"0-0\"", mtime));
+    }
+
+    #[test]
+    fn honor_range_etag_match() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(hyper::header::IF_RANGE, "W/\"100-42\"".parse().unwrap());
+        let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        assert!(should_honor_range(&headers, "W/\"100-42\"", mtime));
+    }
+
+    #[test]
+    fn honor_range_etag_mismatch() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(hyper::header::IF_RANGE, "W/\"999-42\"".parse().unwrap());
+        let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        assert!(!should_honor_range(&headers, "W/\"100-42\"", mtime));
     }
 }
