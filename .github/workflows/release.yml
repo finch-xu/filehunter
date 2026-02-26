@@ -18,8 +18,14 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: x86_64-apple-darwin
+            runner: macos-latest
           - target: aarch64-apple-darwin
             runner: macos-latest
     steps:
@@ -30,10 +36,20 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: runner.os == 'Linux' && matrix.target != 'x86_64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu)
+              sudo apt-get install -y gcc-aarch64-linux-gnu
+              ;;
+            x86_64-unknown-linux-musl)
+              sudo apt-get install -y musl-tools
+              ;;
+            aarch64-unknown-linux-musl)
+              sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
+              ;;
+          esac
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
