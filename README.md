@@ -32,6 +32,7 @@ FileHunter routes requests by URL prefix to different groups of search directori
 - **Async streaming** — built on tokio + hyper 1.x with chunked `ReaderStream` for low memory usage
 - **HTTP/1.1 & HTTP/2** — automatic protocol negotiation via `hyper-util`
 - **Security hardened** — path traversal protection, TOCTOU mitigation, null byte rejection, dotfile blocking, prefix segment-boundary checks, `nosniff` headers
+- **Optional Basic Auth** — global HTTP Basic Authentication with constant-time password comparison; health endpoints exempt
 - **Optional response compression** — gzip, deflate, Brotli, zstd (disabled by default, ideal for standalone public deployments)
 - **Human-friendly config** — TOML format with size values like `"10MB"`, `"64KB"`
 - **Tiny footprint** — ~3 MB binary (LTO + strip)
@@ -83,6 +84,12 @@ max_file_size = "10MB"          # 0 = no limit
 # enabled = false               # enable gzip/deflate/br/zstd
 # algorithms = ["gzip", "br"]
 # min_size = "1KB"
+
+# [server.basic_auth]
+# enabled = false               # enable HTTP Basic Authentication
+# username = "admin"
+# password = "secret"
+# realm = "filehunter"
 
 [[locations]]
 prefix = "/imgs"
@@ -263,6 +270,7 @@ RUST_LOG=filehunter=debug ./filehunter --config config.toml
 - Null bytes rejected
 - Hidden files and directories (dotfiles) blocked
 - `X-Content-Type-Options: nosniff` on all responses
+- Optional HTTP Basic Authentication with constant-time comparison (health endpoints exempt)
 - Connection timeout protection against slow-loris attacks
 - Request size limits (headers + body)
 - File size limit to prevent serving unexpectedly large files

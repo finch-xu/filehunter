@@ -32,6 +32,7 @@ FileHunter 按 URL 前缀将请求路由到不同的搜索目录组，找到文�
 - **异步流式传输** — 基于 tokio + hyper 1.x，使用 `ReaderStream` 分块传输，内存占用极低
 - **HTTP/1.1 & HTTP/2** — 通过 `hyper-util` 自动协商协议
 - **安全加固** — 路径穿越防护、TOCTOU 缓解、空字节拒绝、隐藏文件屏蔽、前缀段边界检查、`nosniff` 响应头
+- **可选 Basic Auth** — 全局 HTTP 基本认证，常量时间密码比较；健康检查端点免认证
 - **可选响应压缩** — 支持 gzip、deflate、Brotli、zstd（默认关闭，适用于独立公网部署）
 - **人性化配置** — TOML 格式，支持 `"10MB"`、`"64KB"` 等可读单位
 - **极小体积** — 二进制约 3 MB（LTO + strip）
@@ -83,6 +84,12 @@ bind = "0.0.0.0:8080"
 # enabled = false               # 启用 gzip/deflate/br/zstd 压缩
 # algorithms = ["gzip", "br"]
 # min_size = "1KB"
+
+# [server.basic_auth]
+# enabled = false               # 启用 HTTP 基本认证
+# username = "admin"
+# password = "secret"
+# realm = "filehunter"          # 认证领域名称
 
 [[locations]]
 prefix = "/imgs"
@@ -263,6 +270,7 @@ RUST_LOG=filehunter=debug ./filehunter --config config.toml
 - 空字节注入拒绝
 - 隐藏文件和目录（dotfiles）屏蔽
 - 所有响应添加 `X-Content-Type-Options: nosniff`
+- 可选 HTTP 基本认证，使用常量时间比较（健康检查端点免认证）
 - 连接超时防护 slow-loris 攻击
 - 请求大小限制（头部 + 正文）
 - 文件大小限制，防止意外提供超大文件
