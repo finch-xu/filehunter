@@ -18,7 +18,10 @@ use tracing::{debug, info, warn};
 
 use governor::clock::Clock;
 
-use crate::config::{normalize_prefix, Config, LocationConfig, SearchMode};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+
+use crate::config::{normalize_prefix, BasicAuthConfig, Config, LocationConfig, SearchMode};
 use crate::ratelimit::KeyedLimiter;
 
 pub type ResponseBody = BoxBody<Bytes, std::io::Error>;
@@ -398,10 +401,54 @@ fn sanitize_path(raw: &str) -> Option<PathBuf> {
 // HTTP handler
 // ---------------------------------------------------------------------------
 
+/// Validate Basic Auth credentials from the Authorization header.
+///
+/// Uses constant-time comparison (XOR-fold) to prevent timing attacks.
+fn check_basic_auth(headers: &hyper::HeaderMap, auth: &BasicAuthConfig) -> bool {
+    let Some(header_val) = headers.get(hyper::header::AUTHORIZATION) else {
+        return false;
+    };
+    let Ok(val) = header_val.to_str() else {
+        return false;
+    };
+    let Some(encoded) = val.strip_prefix("Basic ") else {
+        return false;
+    };
+    let Ok(decoded_bytes) = BASE64_STANDARD.decode(encoded.trim()) else {
+        return false;
+    };
+    let Ok(decoded) = std::str::from_utf8(&decoded_bytes) else {
+        return false;
+    };
+    let Some((user, pass)) = decoded.split_once(':') else {
+        return false;
+    };
+
+    // Constant-time comparison: always compare all bytes to prevent timing attacks.
+    let user_bytes = user.as_bytes();
+    let pass_bytes = pass.as_bytes();
+    let expected_user = auth.username.as_bytes();
+    let expected_pass = auth.password.as_bytes();
+
+    let user_len_match = user_bytes.len() == expected_user.len();
+    let pass_len_match = pass_bytes.len() == expected_pass.len();
+
+    let mut acc: u8 = 0;
+    for (a, b) in user_bytes.iter().zip(expected_user.iter()) {
+        acc |= a ^ b;
+    }
+    for (a, b) in pass_bytes.iter().zip(expected_pass.iter()) {
+        acc |= a ^ b;
+    }
+
+    user_len_match && pass_len_match && acc == 0
+}
+
 pub async fn handle_request(
     req: Request<impl hyper::body::Body + Send + 'static>,
     searcher: Arc<FileSearcher>,
     limiter: Option<Arc<KeyedLimiter>>,
+    auth: Option<Arc<BasicAuthConfig>>,
     client_ip: IpAddr,
 ) -> Result<Response<ResponseBody>, Infallible> {
     let path = req.uri().path();
@@ -426,6 +473,23 @@ pub async fn handle_request(
             .header("Content-Length", msg.len())
             .body(body)
             .unwrap());
+    }
+
+    // Basic Auth (checked after health endpoints, before rate limiting).
+    if let Some(ref auth_cfg) = auth {
+        if !check_basic_auth(req.headers(), auth_cfg) {
+            debug!(status = 401, path, "request handled (unauthorized)");
+            return Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(
+                    "WWW-Authenticate",
+                    format!("Basic realm=\"{}\"", auth_cfg.realm),
+                )
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .header("X-Content-Type-Options", "nosniff")
+                .body(full_body("Unauthorized"))
+                .unwrap());
+        }
     }
 
     // Per-IP rate limiting (checked before anything else except health).
@@ -1088,5 +1152,94 @@ mod tests {
         headers.insert(hyper::header::IF_RANGE, "W/\"999-42\"".parse().unwrap());
         let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
         assert!(!should_honor_range(&headers, "W/\"100-42\"", mtime));
+    }
+
+    // -----------------------------------------------------------------------
+    // check_basic_auth (7 tests)
+    // -----------------------------------------------------------------------
+
+    fn test_auth_config() -> BasicAuthConfig {
+        BasicAuthConfig {
+            enabled: true,
+            username: "admin".into(),
+            password: "secret".into(),
+            realm: "filehunter".into(),
+        }
+    }
+
+    #[test]
+    fn basic_auth_missing_header_fails() {
+        let headers = hyper::HeaderMap::new();
+        assert!(!check_basic_auth(&headers, &test_auth_config()));
+    }
+
+    #[test]
+    fn basic_auth_valid_credentials_passes() {
+        let mut headers = hyper::HeaderMap::new();
+        // "admin:secret" → base64 "YWRtaW46c2VjcmV0"
+        headers.insert(
+            hyper::header::AUTHORIZATION,
+            "Basic YWRtaW46c2VjcmV0".parse().unwrap(),
+        );
+        assert!(check_basic_auth(&headers, &test_auth_config()));
+    }
+
+    #[test]
+    fn basic_auth_wrong_password_fails() {
+        let mut headers = hyper::HeaderMap::new();
+        // "admin:wrong" → base64 "YWRtaW46d3Jvbmc="
+        headers.insert(
+            hyper::header::AUTHORIZATION,
+            "Basic YWRtaW46d3Jvbmc=".parse().unwrap(),
+        );
+        assert!(!check_basic_auth(&headers, &test_auth_config()));
+    }
+
+    #[test]
+    fn basic_auth_non_basic_scheme_fails() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::AUTHORIZATION,
+            "Bearer some-token".parse().unwrap(),
+        );
+        assert!(!check_basic_auth(&headers, &test_auth_config()));
+    }
+
+    #[test]
+    fn basic_auth_malformed_base64_fails() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::AUTHORIZATION,
+            "Basic !!!not-base64!!!".parse().unwrap(),
+        );
+        assert!(!check_basic_auth(&headers, &test_auth_config()));
+    }
+
+    #[test]
+    fn basic_auth_no_colon_separator_fails() {
+        let mut headers = hyper::HeaderMap::new();
+        // "adminonly" (no colon) → base64 "YWRtaW5vbmx5"
+        headers.insert(
+            hyper::header::AUTHORIZATION,
+            "Basic YWRtaW5vbmx5".parse().unwrap(),
+        );
+        assert!(!check_basic_auth(&headers, &test_auth_config()));
+    }
+
+    #[test]
+    fn basic_auth_password_with_colon_passes() {
+        let auth = BasicAuthConfig {
+            enabled: true,
+            username: "admin".into(),
+            password: "pass:word".into(),
+            realm: "filehunter".into(),
+        };
+        let mut headers = hyper::HeaderMap::new();
+        // "admin:pass:word" → base64 "YWRtaW46cGFzczp3b3Jk"
+        headers.insert(
+            hyper::header::AUTHORIZATION,
+            "Basic YWRtaW46cGFzczp3b3Jk".parse().unwrap(),
+        );
+        assert!(check_basic_auth(&headers, &auth));
     }
 }

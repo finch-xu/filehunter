@@ -18,7 +18,7 @@ use tower_http::compression::{CompressionBody, CompressionLayer};
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer, ExposeHeaders};
 use tracing::{debug, info};
 
-use filehunter::config::{CompressionConfig, Config, CorsConfig};
+use filehunter::config::{BasicAuthConfig, CompressionConfig, Config, CorsConfig};
 use filehunter::ratelimit::{self, KeyedLimiter};
 use filehunter::server::{handle_request, FileSearcher, ResponseBody};
 
@@ -189,6 +189,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Basic auth (optional).
+    let auth: Option<Arc<BasicAuthConfig>> = if config.server.basic_auth.enabled {
+        info!(realm = %config.server.basic_auth.realm, "basic auth enabled");
+        Some(Arc::new(config.server.basic_auth.clone()))
+    } else {
+        None
+    };
+
     let listener = TcpListener::bind(addr).await?;
     info!(
         %addr,
@@ -206,6 +214,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limit_rps = config.server.rate_limit.requests_per_second,
         rate_limit_burst = config.server.rate_limit.burst_size,
         compression_enabled = config.server.compression.enabled,
+        basic_auth_enabled = config.server.basic_auth.enabled,
         "server listening"
     );
 
@@ -218,6 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let cors_layer = cors_layer.clone();
                 let compression_layer = compression_layer.clone();
                 let limiter = limiter.clone();
+                let auth = auth.clone();
                 let client_ip = remote_addr.ip();
 
                 tokio::spawn(async move {
@@ -226,8 +236,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let inner = tower::service_fn(move |req: Request<Incoming>| {
                         let searcher = searcher.clone();
                         let limiter = limiter.clone();
+                        let auth = auth.clone();
                         async move {
-                            handle_request(req, searcher, limiter, client_ip).await
+                            handle_request(req, searcher, limiter, auth, client_ip).await
                         }
                     });
 

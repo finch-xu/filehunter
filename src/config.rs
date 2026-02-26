@@ -190,6 +190,26 @@ impl Default for CompressionConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BasicAuthConfig {
+    pub enabled: bool,
+    pub username: String,
+    pub password: String,
+    pub realm: String,
+}
+
+impl Default for BasicAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            username: String::new(),
+            password: String::new(),
+            realm: "filehunter".into(),
+        }
+    }
+}
+
 /// All fields except `bind` have sensible defaults — existing configs keep working.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -230,6 +250,9 @@ pub struct ServerConfig {
 
     /// Response compression configuration.
     pub compression: CompressionConfig,
+
+    /// Basic authentication configuration.
+    pub basic_auth: BasicAuthConfig,
 }
 
 impl Default for ServerConfig {
@@ -247,6 +270,7 @@ impl Default for ServerConfig {
             cors: CorsConfig::default(),
             rate_limit: RateLimitConfig::default(),
             compression: CompressionConfig::default(),
+            basic_auth: BasicAuthConfig::default(),
         }
     }
 }
@@ -380,6 +404,19 @@ impl Config {
             if self.server.compression.algorithms.is_empty() {
                 return Err(
                     "compression.algorithms must not be empty when compression is enabled".into(),
+                );
+            }
+        }
+
+        if self.server.basic_auth.enabled {
+            if self.server.basic_auth.username.is_empty() {
+                return Err(
+                    "basic_auth.username must not be empty when basic_auth is enabled".into(),
+                );
+            }
+            if self.server.basic_auth.password.is_empty() {
+                return Err(
+                    "basic_auth.password must not be empty when basic_auth is enabled".into(),
                 );
             }
         }
@@ -612,6 +649,35 @@ mod tests {
         cfg.server.rate_limit.requests_per_second = 0;
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("requests_per_second"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_basic_auth_empty_username() {
+        let mut cfg = valid_config();
+        cfg.server.basic_auth.enabled = true;
+        cfg.server.basic_auth.username = String::new();
+        cfg.server.basic_auth.password = "secret".into();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("username"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_basic_auth_empty_password() {
+        let mut cfg = valid_config();
+        cfg.server.basic_auth.enabled = true;
+        cfg.server.basic_auth.username = "admin".into();
+        cfg.server.basic_auth.password = String::new();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("password"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_basic_auth_disabled_allows_empty_credentials() {
+        let mut cfg = valid_config();
+        cfg.server.basic_auth.enabled = false;
+        cfg.server.basic_auth.username = String::new();
+        cfg.server.basic_auth.password = String::new();
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
