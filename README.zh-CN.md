@@ -66,6 +66,8 @@ docker run -p 8080:8080 \
 
 ## 配置说明
 
+> 完整的、可直接复制使用的配置示例请参阅 [配置示例](https://github.com/finch-xu/filehunter/wiki/Configuration-Examples-zh) Wiki 页面。
+
 除 `bind` 和 `locations` 外，所有字段均为可选，带有合理的默认值。
 
 ```toml

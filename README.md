@@ -66,6 +66,8 @@ docker run -p 8080:8080 \
 
 ## Configuration
 
+> For complete, copy-paste-ready examples see the [Configuration Examples](https://github.com/finch-xu/filehunter/wiki/Configuration-Examples) wiki page.
+
 All fields except `bind` and `locations` are optional with sensible defaults.
 
 ```toml
